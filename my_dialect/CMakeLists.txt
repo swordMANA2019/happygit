@@ -1,4 +1,7 @@
 # my_dialect: MLIR add dialect project
+cmake_minimum_required(VERSION 3.16)
+project(Ch2)
+
 set(MLIR_DIR "/mnt/data/build/llvm-build/lib/cmake/mlir")
 set(LLVM_DIR "/mnt/data/build/llvm-build/lib/cmake/llvm")
 
