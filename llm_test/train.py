@@ -1,6 +1,9 @@
 import os
 import random
 import math
+import json
+import time
+from datetime import datetime
 
 import torch
 import torch.optim as optim
@@ -59,6 +62,7 @@ class TextDataset(Dataset):
         with open(file_path, "r", encoding="utf-8") as f:
             corpus = "\n".join(line.strip() for line in f if line.strip())
         ids = tokenizer.encode(corpus, add_special_tokens=False)
+        self.total_tokens = len(ids)
         if len(ids) <= max_len:
             raise RuntimeError(
                 f"Tokenized corpus too small ({len(ids)} tokens). "
@@ -103,8 +107,38 @@ def main():
     update_count = 0
 
     model.train()
+    run_start = time.time()
+    out_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "edu_science_small")
+    os.makedirs(out_dir, exist_ok=True)
+    run_id = datetime.now().strftime("%Y%m%d-%H%M%S")
+    run_dir = os.path.join(out_dir, "runs", run_id)
+    os.makedirs(run_dir, exist_ok=True)
+    metrics_path = os.path.join(run_dir, "metrics.jsonl")
+    summary_path = os.path.join(run_dir, "summary.json")
+    run_config = {
+        "run_id": run_id,
+        "device": str(device),
+        "data_file": data_file,
+        "total_tokens": dataset.total_tokens,
+        "num_blocks": len(dataset),
+        "vocab_size": vocab_size,
+        "lr": lr,
+        "batch_size": batch_size,
+        "grad_accum_steps": grad_accum_steps,
+        "epochs": epochs,
+        "max_seq_len": MAX_SEQ_LEN,
+        "weight_decay": weight_decay,
+        "warmup_ratio": warmup_ratio,
+        "seed": seed,
+    }
+    with open(summary_path, "w", encoding="utf-8") as f:
+        json.dump({"config": run_config, "epochs": []}, f, ensure_ascii=False, indent=2)
+    print(f"Training logs will be saved to: {run_dir}")
+
+    epoch_records = []
     for epoch in range(epochs):
         total_loss = 0.0
+        epoch_start = time.time()
         optimizer.zero_grad(set_to_none=True)
         for i, batch in enumerate(loader, start=1):
             input_ids = batch["input_ids"].to(device)
@@ -137,12 +171,46 @@ def main():
 
         avg_loss = total_loss / max(1, len(loader))
         ppl = torch.exp(torch.tensor(avg_loss)).item()
-        print(f"Epoch {epoch+1}, avg loss: {avg_loss:.4f}, ppl: {ppl:.2f}, updates: {update_count}")
+        epoch_record = {
+            "epoch": epoch + 1,
+            "avg_loss": round(avg_loss, 6),
+            "ppl": round(ppl, 6),
+            "updates": update_count,
+            "lr": optimizer.param_groups[0]["lr"],
+            "epoch_seconds": round(time.time() - epoch_start, 3),
+        }
+        epoch_records.append(epoch_record)
+        with open(metrics_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(epoch_record, ensure_ascii=False) + "\n")
+        print(
+            f"Epoch {epoch+1}, avg loss: {avg_loss:.4f}, "
+            f"ppl: {ppl:.2f}, updates: {update_count}, lr: {optimizer.param_groups[0]['lr']:.6f}"
+        )
+        torch.save(model.state_dict(), os.path.join(run_dir, f"model_epoch_{epoch+1}.pt"))
+        torch.save(
+            {
+                "epoch": epoch + 1,
+                "update_count": update_count,
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "scaler_state_dict": scaler.state_dict(),
+                "config": run_config,
+            },
+            os.path.join(run_dir, "latest_checkpoint.pt"),
+        )
 
-    out_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "edu_science_small")
-    os.makedirs(out_dir, exist_ok=True)
     torch.save(model.state_dict(), os.path.join(out_dir, "model.pt"))
     tokenizer.save_pretrained(out_dir)
+    total_seconds = round(time.time() - run_start, 3)
+    with open(summary_path, "w", encoding="utf-8") as f:
+        json.dump(
+            {"config": run_config, "epochs": epoch_records, "total_seconds": total_seconds},
+            f,
+            ensure_ascii=False,
+            indent=2,
+        )
+    print(f"Saved final model to: {out_dir}")
+    print(f"Saved run summary to: {summary_path}")
 
 
 if __name__ == "__main__":
