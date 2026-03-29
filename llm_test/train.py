@@ -18,6 +18,29 @@ MAX_SEQ_LEN = 1000
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
+def resolve_data_file():
+    # Priority: explicit env var -> current working dir -> script dir.
+    env_path = os.environ.get("SCIENCE_PRETRAIN_FILE")
+    candidates = []
+    if env_path:
+        candidates.append(env_path)
+    candidates.extend(
+        [
+            os.path.join(os.getcwd(), "data", "science_pretrain.txt"),
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "science_pretrain.txt"),
+        ]
+    )
+    for path in candidates:
+        if os.path.isfile(path):
+            return path
+    raise FileNotFoundError(
+        "science_pretrain.txt not found. "
+        "Expected one of: "
+        + ", ".join(candidates)
+        + ". You can also set SCIENCE_PRETRAIN_FILE=/full/path/to/science_pretrain.txt"
+    )
+
+
 class TextDataset(Dataset):
     def __init__(self, file_path, tokenizer, max_len):
         self.tokenizer = tokenizer
@@ -50,8 +73,11 @@ def main():
     criterion = nn.CrossEntropyLoss(ignore_index=-100)
     optimizer = optim.Adam(model.parameters(), lr)
 
-    data_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "science_pretrain.txt")
+    data_file = resolve_data_file()
+    print(f"Using data file: {data_file}")
     dataset = TextDataset(data_file, tokenizer, MAX_SEQ_LEN)
+    if len(dataset) == 0:
+        raise RuntimeError(f"Dataset is empty: {data_file}")
     loader = DataLoader(dataset, batch_size, shuffle=True)
 
     model.train()

@@ -7,7 +7,7 @@ from datasets import load_dataset
 from datasets.download.download_config import DownloadConfig
 from tqdm import tqdm
 
-# Local script: HF wikipedia pins 20220301; Wikimedia removed that dump (404). Patched _DATE=20260301.
+# Local script: date comes from WIKI_DATE (default 20260301).
 _WIKI_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "wikipedia.py")
 
 _EDU_KEYWORDS = [
@@ -19,7 +19,7 @@ _TITLE_RE = re.compile("|".join(re.escape(k) for k in _EDU_KEYWORDS))
 
 
 def _filter_title_batch(batch):
-    return [_TITLE_RE.search(t) is not None for t in batch["title"]]
+    return [_TITLE_RE.search((t or "")) is not None for t in batch["title"]]
 
 
 # ======================
@@ -37,9 +37,11 @@ def load_zh_wiki_science():
             }
         },
     )
+    wiki_date = os.environ.get("WIKI_DATE", "20260301")
+    config_name = f"{wiki_date}.zh"
     ds = load_dataset(
         _WIKI_SCRIPT,
-        "20260301.zh-classical",
+        config_name,
         split="train",
         trust_remote_code=True,
         streaming=False,
@@ -63,16 +65,26 @@ def clean_zh_text(text):
 # 3. 生成预训练 .txt
 # ======================
 def build_pretrain_file(ds, out_path="science_pretrain.txt", min_len=300):
+    kept = 0
     with open(out_path, "w", encoding="utf-8") as f:
         for item in tqdm(ds):
-            text = item["text"]
+            text = item.get("text") or ""
+            text = clean_zh_text(text)
             if len(text) < min_len:
                 continue
-            text = clean_zh_text(text)
             f.write(text + "\n")
+            kept += 1
+    return kept
 
 if __name__ == "__main__":
     data_path = os.path.join(os.getcwd(), "data", "science_pretrain.txt")
     os.makedirs(os.path.dirname(data_path), exist_ok=True)
+    print(f"Using Wikipedia dump date: {os.environ.get('WIKI_DATE', '20260301')}")
     wiki_ds = load_zh_wiki_science()
-    build_pretrain_file(wiki_ds, out_path=data_path)
+    num_samples = build_pretrain_file(wiki_ds, out_path=data_path)
+    if num_samples == 0:
+        raise RuntimeError(
+            "No samples were written to science_pretrain.txt. "
+            "Check filter keywords/date/language config (try WIKI_DATE=20260201)."
+        )
+    print(f"Wrote {num_samples} samples to: {data_path}")

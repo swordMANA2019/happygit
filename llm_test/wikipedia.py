@@ -905,7 +905,7 @@ class WikipediaConfig(datasets.BuilderConfig):
         self.language = language
 
 
-_DATE = "20260301"
+_DATE = os.environ.get("WIKI_DATE", "20260301")
 
 
 PROCESSED_CONFIG_TO_NUM_SHARDS = {
