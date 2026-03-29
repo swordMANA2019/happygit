@@ -2,9 +2,9 @@ import torch
 from torch import nn
 
 # hyper parameters
-HIDDEN_SIZE = 128
-N_HEAD = 8  # d_model must be divisible by nhead (128 % 6 != 0)
-N_LAYERS = 4
+HIDDEN_SIZE = 192
+N_HEAD = 6
+N_LAYERS = 6
 
 # --------------------------
 # 1. 位置编码
@@ -27,15 +27,17 @@ class PositionalEncoding(nn.Module):
 # 2. 单个 Decoder 层（ causal mask）
 # --------------------------
 class DecoderLayer(nn.Module):
-    def __init__(self, d_model, nhead):
+    def __init__(self, d_model, nhead, dropout=0.1):
         super().__init__()
-        self.self_attn = nn.MultiheadAttention(d_model, nhead, batch_first=True)
+        self.self_attn = nn.MultiheadAttention(d_model, nhead, batch_first=True, dropout=dropout)
         self.norm1 = nn.LayerNorm(d_model)
         self.norm2 = nn.LayerNorm(d_model)
         self.ffn = nn.Sequential(
-            nn.Linear(d_model, d_model * 2),
-            nn.ReLU(),
-            nn.Linear(d_model * 2, d_model)
+            nn.Linear(d_model, d_model * 4),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model * 4, d_model),
+            nn.Dropout(dropout),
         )
 
     def forward(self, x, attn_mask):
@@ -55,20 +57,32 @@ class DecoderOnlyModel(nn.Module):
         nhead=N_HEAD,
         num_layers=N_LAYERS,
         max_seq_len=2048,
+        dropout=0.1,
     ):
         super().__init__()
         self.emb = nn.Embedding(vocab_size, d_model)
         self.pos = PositionalEncoding(d_model, max_len=max_seq_len)
-        self.layers = nn.ModuleList([DecoderLayer(d_model, nhead) for _ in range(num_layers)])
+        self.dropout = nn.Dropout(dropout)
+        self.layers = nn.ModuleList([DecoderLayer(d_model, nhead, dropout=dropout) for _ in range(num_layers)])
         self.fc = nn.Linear(d_model, vocab_size)
+        # Tie input/output embeddings to improve sample efficiency.
+        self.fc.weight = self.emb.weight
+        self.register_buffer(
+            "causal_mask",
+            torch.triu(torch.ones(max_seq_len, max_seq_len, dtype=torch.bool), diagonal=1),
+            persistent=False,
+        )
 
     def forward(self, x):
-        B, L = x.shape
+        _, L = x.shape
+        if L > self.causal_mask.size(0):
+            raise ValueError(f"sequence length {L} exceeds max_seq_len {self.causal_mask.size(0)}")
         x = self.emb(x)
         x = self.pos(x)
+        x = self.dropout(x)
 
         # 因果掩码：只能看左边
-        mask = nn.Transformer.generate_square_subsequent_mask(L).to(x.device)
+        mask = self.causal_mask[:L, :L].to(x.device)
         for layer in self.layers:
             x = layer(x, mask)
 
