@@ -1,3 +1,4 @@
+import argparse
 import hashlib
 import inspect
 import json
@@ -17,20 +18,52 @@ except ImportError:
 
 from model import DecoderOnlyModel
 
+# 命令行参数解析
+def parse_args():
+    parser = argparse.ArgumentParser(description="Decoder-Only LLM Pretraining Script")
+    # 唯一必填参数：数据根目录
+    parser.add_argument(
+        "--data_dir", 
+        type=str, 
+        required=True, 
+        help="Root directory for all data (json, tokenizer, cache)"
+    )
+    # 可选参数：手动指定batch size（不填则自动适配GPU）
+    parser.add_argument(
+        "--train_batch_size", 
+        type=int, 
+        default=None, 
+        help="Per device train batch size (auto if not set)"
+    )
+    parser.add_argument(
+        "--eval_batch_size", 
+        type=int, 
+        default=None, 
+        help="Per device eval batch size (auto if not set)"
+    )
+    parser.add_argument(
+        "--grad_accum", 
+        type=int, 
+        default=None, 
+        help="Gradient accumulation steps (auto if not set)"
+    )
+    return parser.parse_args()
+
 MODEL_ID = os.environ.get("MODEL_ID", "Qwen/Qwen2-0.5B")
+_TOKEN_CACHE_SCHEMA = "full_chunk_ctx_v1"
 
-_DATA_JSON = os.environ.get(
-    "PRETRAIN_DATA_JSON",
-    "/mnt/build/llm_data/wikipedia-zh-cn-20240820.json",
-)
-TOKENIZER_DIR = "/mnt/build/llm_data/tokenizer"
+# ===================== 自动路径生成函数 =====================
+def get_data_paths(data_dir: str):
+    """自动生成所有数据路径（基于根目录）"""
+    return {
+        "data_json": os.path.join(data_dir, "wikipedia-zh-cn-20240820.json"),
+        "tokenizer_dir": os.path.join(data_dir, "tokenizer"),
+        "cache_root": data_dir,  # 缓存根目录
+    }
+# ==========================================================
 
-def _choose_training_batch_hyperparams():
-    """Pick batch sizes and grad accumulation from GPU VRAM to avoid CUDA OOM.
-
-    Override: PRETRAIN_PER_DEVICE_TRAIN_BATCH_SIZE, PRETRAIN_PER_DEVICE_EVAL_BATCH_SIZE,
-    PRETRAIN_GRADIENT_ACCUMULATION_STEPS, PRETRAIN_TARGET_EFFECTIVE_BATCH (default 128).
-    """
+# 自动适配batch size（优先命令行参数）
+def _choose_training_batch_hyperparams(cmd_train_bs=None, cmd_eval_bs=None, cmd_grad_accum=None):
     target_eff = int(os.environ.get("PRETRAIN_TARGET_EFFECTIVE_BATCH", "128"))
     e_bs = os.environ.get("PRETRAIN_PER_DEVICE_TRAIN_BATCH_SIZE", "").strip()
     e_ev = os.environ.get("PRETRAIN_PER_DEVICE_EVAL_BATCH_SIZE", "").strip()
@@ -43,7 +76,10 @@ def _choose_training_batch_hyperparams():
         total_gb = props.total_memory / (1024**3)
         dev_name = props.name
 
-    if e_bs:
+    # 优先级：命令行参数 > 环境变量 > 自动适配
+    if cmd_train_bs is not None:
+        train_bs = max(1, cmd_train_bs)
+    elif e_bs:
         train_bs = max(1, int(e_bs))
     elif not torch.cuda.is_available():
         train_bs = 2
@@ -59,7 +95,9 @@ def _choose_training_batch_hyperparams():
         else:
             train_bs = 16
 
-    if e_ev:
+    if cmd_eval_bs is not None:
+        eval_bs = max(1, cmd_eval_bs)
+    elif e_ev:
         eval_bs = max(1, int(e_ev))
     elif not torch.cuda.is_available():
         eval_bs = train_bs
@@ -68,30 +106,17 @@ def _choose_training_batch_hyperparams():
     else:
         eval_bs = min(train_bs, 8)
 
-    if e_ga:
+    if cmd_grad_accum is not None:
+        grad_accum = max(1, cmd_grad_accum)
+    elif e_ga:
         grad_accum = max(1, int(e_ga))
     else:
         grad_accum = max(1, (target_eff + train_bs - 1) // train_bs)
 
     return train_bs, eval_bs, grad_accum, total_gb, dev_name
 
-
-# Tokenized DatasetDict cache (train/test splits, fixed-length chunks).
-# Set PRETRAIN_REBUILD_TOKEN_CACHE=1 to ignore cache and remap.
-# Set PRETRAIN_TOKEN_CACHE=0 to disable read/write cache for this run.
-_TOKEN_CACHE_SCHEMA = "full_chunk_ctx_v1"  # bump if tokenize() logic changes
-
-
-def _token_cache_root() -> str:
-    return os.environ.get(
-        "PRETRAIN_TOKEN_CACHE_ROOT",
-        os.environ.get("LLM_DATA_ROOT", "/mnt/build/llm_data"),
-    )
-
-
 def _data_mtime_ns(st: os.stat_result) -> int:
     return int(getattr(st, "st_mtime_ns", int(st.st_mtime * 1e9)))
-
 
 def _token_cache_fingerprint(
     data_json: str, context_length: int, model_id: str, test_size: float, seed: int
@@ -112,7 +137,6 @@ def _token_cache_fingerprint(
     )
     return hashlib.sha256(key.encode("utf-8")).hexdigest()[:24]
 
-
 def _token_cache_meta(
     data_json: str, context_length: int, model_id: str, test_size: float, seed: int
 ) -> dict:
@@ -129,28 +153,20 @@ def _token_cache_meta(
         "seed": seed,
     }
 
-
-def _load_or_build_tokenized(raw_data, tokenizer, context_length: int) -> datasets.DatasetDict:
+# 加载/构建tokenized数据集（自动使用根目录缓存）
+def _load_or_build_tokenized(
+    data_json: str, cache_root: str, raw_data, tokenizer, context_length: int
+) -> datasets.DatasetDict:
     test_size = 0.1
     seed = 2333
-    fp = _token_cache_fingerprint(_DATA_JSON, context_length, MODEL_ID, test_size, seed)
-    root = os.path.join(_token_cache_root(), "pretrain_token_cache", fp)
+    fp = _token_cache_fingerprint(data_json, context_length, MODEL_ID, test_size, seed)
+    root = os.path.join(cache_root, "pretrain_token_cache", fp)
     ds_path = os.path.join(root, "dataset")
     meta_path = os.path.join(root, "meta.json")
 
-    use_cache = os.environ.get("PRETRAIN_TOKEN_CACHE", "1").strip().lower() not in (
-        "0",
-        "false",
-        "no",
-        "off",
-    )
-    rebuild = os.environ.get("PRETRAIN_REBUILD_TOKEN_CACHE", "").strip().lower() in (
-        "1",
-        "true",
-        "yes",
-    )
-
-    meta = _token_cache_meta(_DATA_JSON, context_length, MODEL_ID, test_size, seed)
+    use_cache = os.environ.get("PRETRAIN_TOKEN_CACHE", "1").strip().lower() not in ("0", "false", "no", "off")
+    rebuild = os.environ.get("PRETRAIN_REBUILD_TOKEN_CACHE", "").strip().lower() in ("1", "true", "yes")
+    meta = _token_cache_meta(data_json, context_length, MODEL_ID, test_size, seed)
 
     if use_cache and not rebuild and os.path.isdir(ds_path):
         try:
@@ -159,11 +175,8 @@ def _load_or_build_tokenized(raw_data, tokenizer, context_length: int) -> datase
             if disk_meta == meta:
                 print(f"Loading tokenized dataset from cache: {ds_path}", flush=True)
                 return datasets.load_from_disk(ds_path)
-            print(
-                "Token cache fingerprint mismatch (data or settings changed); remapping…",
-                flush=True,
-            )
-        except (OSError, json.JSONDecodeError, TypeError) as e:
+            print("Token cache mismatch; remapping…", flush=True)
+        except Exception as e:
             print(f"Token cache unreadable ({e}); remapping…", flush=True)
 
     def tokenize(element):
@@ -180,26 +193,23 @@ def _load_or_build_tokenized(raw_data, tokenizer, context_length: int) -> datase
                 input_batch.append(input_ids)
         return {"input_ids": input_batch}
 
-    print("Tokenizing dataset (first run or cache miss; this can take a long time)…", flush=True)
+    print("Tokenizing dataset…", flush=True)
     os.makedirs(root, exist_ok=True)
-    tokenized_datasets = raw_data.map(
-        tokenize, batched=True, remove_columns=raw_data["train"].column_names
-    )
+    tokenized_datasets = raw_data.map(tokenize, batched=True, remove_columns=raw_data["train"].column_names)
+    
     if use_cache:
         if os.path.isdir(ds_path):
             shutil.rmtree(ds_path)
         tokenized_datasets.save_to_disk(ds_path)
         with open(meta_path, "w", encoding="utf-8") as f:
             json.dump(meta, f, ensure_ascii=False, indent=2)
-        print(f"Saved tokenized dataset to: {ds_path}", flush=True)
+        print(f"Saved token dataset to: {ds_path}", flush=True)
     return tokenized_datasets
-
 
 def _save_decoder_checkpoint(model: DecoderOnlyModel, config, out_dir: str) -> None:
     os.makedirs(out_dir, exist_ok=True)
     torch.save(model.state_dict(), os.path.join(out_dir, "pytorch_model.bin"))
     config.save_pretrained(out_dir)
-
 
 @torch.no_grad()
 def _greedy_generate(model, tokenizer, prompt: str, max_new_tokens: int = 64, device=None):
@@ -214,66 +224,65 @@ def _greedy_generate(model, tokenizer, prompt: str, max_new_tokens: int = 64, de
     for _ in range(max_new_tokens):
         out = model(input_ids=input_ids)
         next_id = int(out.logits[0, -1, :].argmax().item())
-        input_ids = torch.cat(
-            [input_ids, torch.tensor([[next_id]], dtype=torch.long, device=device)], dim=1
-        )
+        input_ids = torch.cat([input_ids, torch.tensor([[next_id]], device=device)], dim=1)
         if eos is not None and next_id == eos:
             break
     return tokenizer.decode(input_ids[0].tolist(), skip_special_tokens=True)
 
-def load_tokenizer():
-    if not os.path.exists(TOKENIZER_DIR):
+# 自动加载tokenizer（根目录下）
+def load_tokenizer(tokenizer_dir: str):
+    os.makedirs(tokenizer_dir, exist_ok=True)
+    if not os.listdir(tokenizer_dir):
         try:
             tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, trust_remote_code=True)
-            tokenizer.save_pretrained(TOKENIZER_DIR)
+            tokenizer.save_pretrained(tokenizer_dir)
             return tokenizer
         except Exception as e:
-            print(f"load from hf failed:{e}")
+            print(f"Download tokenizer failed: {e}")
             return None
     else:
         try:
-            tokenizer = AutoTokenizer.from_pretrained(
-                TOKENIZER_DIR,
-                local_files_only=True)
-            return tokenizer
+            return AutoTokenizer.from_pretrained(tokenizer_dir, local_files_only=True)
         except Exception as e:
-            print(f"load from local failed:{e}")
-        return None
+            print(f"Load local tokenizer failed: {e}")
+    return None
 
 def main():
-    # using swanlab to save log
+    args = parse_args()
+    # 自动生成所有数据路径
+    paths = get_data_paths(args.data_dir)
     swanlab.init("WikiLLM")
-    # load dataset — must tokenize the same split used for train/eval
-    raw_datasets = datasets.load_dataset("json", data_files=_DATA_JSON)
+
+    # 1. 加载训练数据（根目录下自动读取）
+    raw_datasets = datasets.load_dataset("json", data_files=paths["data_json"])
     raw_data = raw_datasets["train"].train_test_split(test_size=0.1, seed=2333)
-    print("dataset info")
+    print("=== Dataset Info ===")
     print(raw_data)
 
-    context_length = 512  # use a small context length
-
-    tokenizer = load_tokenizer()
+    context_length = 512
+    # 2. 加载tokenizer（根目录下自动保存/加载）
+    tokenizer = load_tokenizer(paths["tokenizer_dir"])
     if tokenizer is None:
         return
-    tokenized_datasets = _load_or_build_tokenized(raw_data, tokenizer, context_length)
+    
+    # 3. 加载/构建数据集缓存（根目录下自动管理）
+    tokenized_datasets = _load_or_build_tokenized(
+        paths["data_json"], paths["cache_root"], raw_data, tokenizer, context_length
+    )
+
+    # 裁剪数据集（可选）
     _mx = os.environ.get("PRETRAIN_MAX_TRAIN_SAMPLES", "").strip()
-    if _mx:
-        _n = int(_mx)
-        tokenized_datasets["train"] = tokenized_datasets["train"].select(
-            range(min(_n, len(tokenized_datasets["train"])))
-        )
+    if _mx: tokenized_datasets["train"] = tokenized_datasets["train"].select(range(int(_mx)))
     _mx = os.environ.get("PRETRAIN_MAX_EVAL_SAMPLES", "").strip()
-    if _mx:
-        _n = int(_mx)
-        tokenized_datasets["test"] = tokenized_datasets["test"].select(
-            range(min(_n, len(tokenized_datasets["test"])))
-        )
-    print("tokenize dataset info")
+    if _mx: tokenized_datasets["test"] = tokenized_datasets["test"].select(range(int(_mx)))
+    
+    print("=== Tokenized Dataset Info ===")
     print(tokenized_datasets)
     tokenizer.pad_token = tokenizer.eos_token
     data_collator = transformers.DataCollatorForLanguageModeling(tokenizer, mlm=False)
 
-    config = Qwen2Config.from_pretrained(
-        MODEL_ID,
+    # 模型配置
+    config = Qwen2Config(
         vocab_size=len(tokenizer),
         hidden_size=512,
         intermediate_size=2048,
@@ -283,107 +292,65 @@ def main():
         bos_token_id=tokenizer.bos_token_id,
         eos_token_id=tokenizer.eos_token_id
     )
-    # print(f"config:{config}")
     model = DecoderOnlyModel(config=config, dropout=0.1)
-
     model_size = sum(t.numel() for t in model.parameters())
-    print("Model Config:")
-    print(config)
-    print(f"Model Size: {model_size/1000**2:.1f}M parameters")
+    print(f"=== Model Size: {model_size/1000**2:.1f}M parameters ===")
 
-    # Precision: torch.nn.MultiheadAttention under bf16 can raise
-    # CUBLAS_STATUS_NOT_SUPPORTED on some GPUs/drivers. Default to fp16 on CUDA, fp32 on CPU.
-    # Set PRETRAIN_USE_BF16=1 to force bf16 (if your stack supports it).
+    # 精度设置
     _cuda = torch.cuda.is_available()
-    _bf16_ok = _cuda and getattr(torch.cuda, "is_bf16_supported", lambda: False)()
-    _force_bf16 = os.environ.get("PRETRAIN_USE_BF16", "").strip().lower() in ("1", "true", "yes")
-    _force_fp32 = os.environ.get("PRETRAIN_USE_FP32", "").strip().lower() in ("1", "true", "yes")
-    if _force_fp32:
+    _bf16_ok = _cuda and torch.cuda.is_bf16_supported()
+    use_bf16 = os.environ.get("PRETRAIN_USE_BF16", "") in ("1", "true") and _bf16_ok
+    use_fp16 = not use_bf16 and _cuda
+    if os.environ.get("PRETRAIN_USE_FP32", "") in ("1", "true"):
         use_bf16, use_fp16 = False, False
-    elif _force_bf16 and _bf16_ok:
-        use_bf16, use_fp16 = True, False
-    else:
-        use_bf16, use_fp16 = False, _cuda
 
-    train_bs, eval_bs, grad_accum, vram_gb, dev_name = _choose_training_batch_hyperparams()
-    if torch.cuda.is_available():
-        print(
-            f"GPU {dev_name}: ~{vram_gb:.2f} GiB — "
-            f"per_device_train_batch_size={train_bs}, "
-            f"per_device_eval_batch_size={eval_bs}, "
-            f"gradient_accumulation_steps={grad_accum}",
-            flush=True,
-        )
-    else:
-        print(
-            f"CPU run — train_bs={train_bs}, eval_bs={eval_bs}, grad_accum={grad_accum}",
-            flush=True,
-        )
+    # 批量大小配置
+    train_bs, eval_bs, grad_accum, vram_gb, dev_name = _choose_training_batch_hyperparams(
+        args.train_batch_size, args.eval_batch_size, args.grad_accum
+    )
+    print(f"Batch Config: train={train_bs}, eval={eval_bs}, grad_accum={grad_accum}")
 
-    # train
-    _dl_workers = os.environ.get("PRETRAIN_DATALOADER_WORKERS", "").strip()
-    if _dl_workers != "":
-        dataloader_num_workers = max(0, int(_dl_workers))
-    elif torch.cuda.is_available() and vram_gb < 6.0:
-        dataloader_num_workers = 0
-    else:
-        dataloader_num_workers = 2
-
-    args = transformers.TrainingArguments(
-        output_dir="data",
+    # 数据加载器配置
+    num_workers = int(os.environ.get("PRETRAIN_DATALOADER_WORKERS", 2 if (_cuda and vram_gb>=6) else 0))
+    
+    # 训练参数
+    training_args = transformers.TrainingArguments(
+        output_dir=os.path.join(args.data_dir, "train_output"),
         per_device_train_batch_size=train_bs,
         per_device_eval_batch_size=eval_bs,
-        eval_strategy="steps",
-        eval_steps=5_00,
-        logging_steps=50,
         gradient_accumulation_steps=grad_accum,
-        num_train_epochs=2,  # 训练epoch数
-        weight_decay=0.1,
-        warmup_steps=2_00,
-        optim="adamw_torch",  # 优化器使用adamw
-        lr_scheduler_type="cosine",  # 学习率衰减策略
-        learning_rate=5e-4,  # 基础学习率，
-        save_steps=5_00,
-        save_total_limit=10,
-        bf16=use_bf16,
-        fp16=use_fp16,
-        dataloader_num_workers=dataloader_num_workers,
-        dataloader_pin_memory=torch.cuda.is_available() and vram_gb >= 6.0,
+        eval_strategy="steps", eval_steps=500, logging_steps=50,
+        num_train_epochs=2, weight_decay=0.1, warmup_steps=200,
+        learning_rate=5e-4, lr_scheduler_type="cosine", optim="adamw_torch",
+        save_steps=500, save_total_limit=10,
+        bf16=use_bf16, fp16=use_fp16,
+        dataloader_num_workers=num_workers,
+        dataloader_pin_memory=_cuda and vram_gb >= 6,
     )
-    print(
-        f"Train precision: bf16={use_bf16} fp16={use_fp16} "
-        f"(override: PRETRAIN_USE_BF16=1 or PRETRAIN_USE_FP32=1)"
-    )
-    print("Train Args:")
-    print(args)
-    # enjoy training
-    _trainer_kw = dict(
+
+    # 训练
+    trainer = transformers.Trainer(
         model=model,
-        args=args,
+        args=training_args,
         data_collator=data_collator,
         train_dataset=tokenized_datasets["train"],
         eval_dataset=tokenized_datasets["test"],
         callbacks=[SwanLabCallback()],
+        tokenizer=tokenizer,
     )
-    if "processing_class" in inspect.signature(transformers.Trainer.__init__).parameters:
-        _trainer_kw["processing_class"] = tokenizer
-    else:
-        _trainer_kw["tokenizer"] = tokenizer
-    trainer = transformers.Trainer(**_trainer_kw)
     trainer.train()
-    # Custom nn.Module: save weights + HF config (no model.save_pretrained)
-    weight_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "Weight")
-    _save_decoder_checkpoint(model, config, weight_dir)
 
+    # 保存模型（根目录下）
+    weight_dir = os.path.join(args.data_dir, "model_weights")
+    _save_decoder_checkpoint(model, config, weight_dir)
+    print(f"Model saved to: {weight_dir}")
+
+    # 生成测试
     device = next(model.parameters()).device
-    gen1 = _greedy_generate(model, tokenizer, "人工智能", max_new_tokens=64, device=device)
-    print("GENERATE:", gen1)
-    prompts = ["牛顿", "北京市", "亚洲历史"]
-    examples = []
-    for p in prompts:
-        text = _greedy_generate(model, tokenizer, p, max_new_tokens=64, device=device)
-        examples.append(swanlab.Text(text))
-    swanlab.log({"Generate": examples})
+    print("\n=== Generation Test ===")
+    print(_greedy_generate(model, tokenizer, "人工智能", device=device))
+    for p in ["牛顿", "北京市", "亚洲历史"]:
+        print(_greedy_generate(model, tokenizer, p, device=device))
 
 if __name__ == '__main__':
     main()

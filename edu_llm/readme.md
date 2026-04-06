@@ -1,0 +1,1 @@
+python pretrain.py --data_dir /home/tliang/tl_build/data --train_batch_size 8 --eval_batch_size 4
