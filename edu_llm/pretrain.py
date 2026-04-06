@@ -23,7 +23,7 @@ _DATA_JSON = os.environ.get(
     "PRETRAIN_DATA_JSON",
     "/mnt/build/llm_data/wikipedia-zh-cn-20240820.json",
 )
-
+TOKENIZER_DIR = "/mnt/build/llm_data/tokenizer"
 
 def _choose_training_batch_hyperparams():
     """Pick batch sizes and grad accumulation from GPU VRAM to avoid CUDA OOM.
@@ -221,6 +221,24 @@ def _greedy_generate(model, tokenizer, prompt: str, max_new_tokens: int = 64, de
             break
     return tokenizer.decode(input_ids[0].tolist(), skip_special_tokens=True)
 
+def load_tokenizer():
+    if not os.path.exists(TOKENIZER_DIR):
+        try:
+            tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, trust_remote_code=True)
+            tokenizer.save_pretrained(TOKENIZER_DIR)
+            return tokenizer
+        except Exception as e:
+            print(f"load from hf failed:{e}")
+            return None
+    else:
+        try:
+            tokenizer = AutoTokenizer.from_pretrained(
+                TOKENIZER_DIR,
+                local_files_only=True)
+            return tokenizer
+        except Exception as e:
+            print(f"load from local failed:{e}")
+        return None
 
 def main():
     # using swanlab to save log
@@ -232,8 +250,10 @@ def main():
     print(raw_data)
 
     context_length = 512  # use a small context length
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, trust_remote_code=True)
 
+    tokenizer = load_tokenizer()
+    if tokenizer is None:
+        return
     tokenized_datasets = _load_or_build_tokenized(raw_data, tokenizer, context_length)
     _mx = os.environ.get("PRETRAIN_MAX_TRAIN_SAMPLES", "").strip()
     if _mx:
