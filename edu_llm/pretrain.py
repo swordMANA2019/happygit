@@ -7,6 +7,7 @@ import shutil
 import traceback
 import logging
 from datetime import datetime
+from enum import Enum
 
 import datasets
 import torch
@@ -216,11 +217,18 @@ def load_tokenizer(tokenizer_dir: str):
         return None
 
 # ===================== 主训练函数 =====================
+class TrainExitState(str, Enum):
+    COMPLETED = "completed"
+    INTERRUPTED = "interrupted"
+    FAILED = "failed"
+
+
 def main():
     args = parse_args()
     paths = get_data_paths(args.data_dir)
     global logger
     logger = init_logger(paths["log_dir"])  # 初始化日志
+    train_exit_state = None
 
     try:
         swanlab.init("WikiLLM", logdir=os.path.join(paths["train_output"], "swanlog"))
@@ -290,29 +298,41 @@ def main():
         )
 
         # ===================== 自动断点续训 =====================
+        logger.info(">>> 进入训练阶段")
         latest_ckpt = get_latest_checkpoint(paths["train_output"])
         if latest_ckpt:
             logger.info(f"找到检查点，从 {latest_ckpt} 继续训练")
-            trainer.train(resume_from_checkpoint=latest_ckpt)
+            train_result = trainer.train(resume_from_checkpoint=latest_ckpt)
         else:
             # 无检查点则尝试加载手动保存的模型
             if load_model_weights(model, paths["model_weights"]):
                 logger.info("从保存的模型权重开始训练")
-            trainer.train()
+            train_result = trainer.train()
+        logger.info(f">>> 训练阶段完成（global_step={trainer.state.global_step}, loss={getattr(train_result, 'training_loss', 'N/A')}）")
 
         # 保存最终模型
         _save_decoder_checkpoint(model, config, paths["model_weights"])
 
         # 生成测试
-        logger.info("\n 生成测试结果：")
+        logger.info(">>> 生成测试结果：")
         device = next(model.parameters()).device
         for prompt in ["人工智能", "牛顿", "北京市", "亚洲历史"]:
             res = _greedy_generate(model, tokenizer, prompt, device=device)
             logger.info(f"{prompt}: {res}")
 
         logger.info("训练任务完成！")
+        train_exit_state = TrainExitState.COMPLETED
 
+    except KeyboardInterrupt:
+        train_exit_state = TrainExitState.INTERRUPTED
+        logger.warning("训练被手动中断（KeyboardInterrupt）")
+        raise
+    except SystemExit as e:
+        train_exit_state = TrainExitState.INTERRUPTED
+        logger.warning(f"训练进程收到退出信号（SystemExit: code={e.code}）")
+        raise
     except Exception as e:
+        train_exit_state = TrainExitState.FAILED
         # ===================== 异常捕获：保存堆栈 =====================
         error_msg = f"训练异常中断：{str(e)}"
         stack_msg = traceback.format_exc()
@@ -324,6 +344,15 @@ def main():
         with open(error_file, "w", encoding="utf-8") as f:
             f.write(error_msg + "\n" + stack_msg)
         raise  # 抛出异常便于查看
+    finally:
+        if train_exit_state == TrainExitState.COMPLETED:
+            logger.info(">>> 进程退出状态：训练完整结束，已完成生成测试")
+        elif train_exit_state == TrainExitState.INTERRUPTED:
+            logger.warning(">>> 进程退出状态：训练被中断，未完成完整收尾")
+        elif train_exit_state == TrainExitState.FAILED:
+            logger.critical(">>> 进程退出状态：训练异常失败，请查看 error_*.log")
+        else:
+            logger.warning(">>> 进程退出状态：训练未进入完整流程（早期退出）")
 
 if __name__ == '__main__':
     main()
