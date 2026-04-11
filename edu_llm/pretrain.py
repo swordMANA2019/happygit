@@ -45,6 +45,7 @@ def parse_args():
     parser.add_argument("--train_batch_size", type=int, default=None, help="单卡训练batch size")
     parser.add_argument("--eval_batch_size", type=int, default=None, help="单卡验证batch size")
     parser.add_argument("--grad_accum", type=int, default=None, help="梯度累积步数")
+    parser.add_argument("--resume_weights_only", action="store_true", help="仅加载检查点模型权重继续训练（重置优化器和学习率调度）")
     return parser.parse_args()
 
 # ===================== 路径配置 =====================
@@ -269,6 +270,7 @@ def main():
             args.train_batch_size, args.eval_batch_size, args.grad_accum
         )
         logger.info(f"Batch配置：train={train_bs}, eval={eval_bs}, grad_accum={grad_accum}")
+        logger.info(f"有效batch（单卡）：effective_batch_size={train_bs * grad_accum}")
 
         # ===================== 训练参数（开启断点续训） =====================
         training_args = transformers.TrainingArguments(
@@ -288,6 +290,10 @@ def main():
             bf16=use_bf16, fp16=use_fp16,
             dataloader_num_workers=2 if (_cuda and vram_gb>=6) else 0,
             dataloader_pin_memory=_cuda and vram_gb >= 6,
+            load_best_model_at_end=True,
+            metric_for_best_model="eval_loss",
+            greater_is_better=False,
+            logging_first_step=True,
         )
 
         # 初始化Trainer
@@ -301,14 +307,22 @@ def main():
         logger.info(">>> 进入训练阶段")
         latest_ckpt = get_latest_checkpoint(paths["train_output"])
         if latest_ckpt:
-            logger.info(f"找到检查点，从 {latest_ckpt} 继续训练")
-            train_result = trainer.train(resume_from_checkpoint=latest_ckpt)
+            if args.resume_weights_only:
+                logger.info(f"找到检查点，按仅权重模式加载：{latest_ckpt}")
+                if load_model_weights(model, latest_ckpt):
+                    logger.info("仅加载模型权重完成：优化器/学习率调度将重新开始")
+                train_result = trainer.train()
+            else:
+                logger.info(f"找到检查点，从 {latest_ckpt} 继续训练")
+                train_result = trainer.train(resume_from_checkpoint=latest_ckpt)
         else:
             # 无检查点则尝试加载手动保存的模型
             if load_model_weights(model, paths["model_weights"]):
                 logger.info("从保存的模型权重开始训练")
             train_result = trainer.train()
         logger.info(f">>> 训练阶段完成（global_step={trainer.state.global_step}, loss={getattr(train_result, 'training_loss', 'N/A')}）")
+        if trainer.state.best_metric is not None:
+            logger.info(f">>> best_eval_loss={trainer.state.best_metric} @ {trainer.state.best_model_checkpoint}")
 
         # 保存最终模型
         _save_decoder_checkpoint(model, config, paths["model_weights"])
