@@ -1,0 +1,96 @@
+
+
+swanlab: 🚀 View run at
+https://swanlab.cn/@swanlab01/WikiLLM/runs/1ksu1tnurhtj1egivdvj2
+2026-04-11 09:41:27,209 - INFO - 开始训练任务...
+2026-04-11 09:41:28,097 - INFO - 数据集加载完成：DatasetDict({
+    train: Dataset({
+        features: ['id', 'title', 'tags', 'text'],
+        num_rows: 1292828
+    })
+    test: Dataset({
+        features: ['id', 'title', 'tags', 'text'],
+        num_rows: 143648
+    })
+})
+2026-04-11 09:41:28,485 - INFO - ✅ 从缓存加载数据集：/home/tliang/tl_build/data/pretrain_token_cache/acad01602aca2c662c1c854b/dataset
+2026-04-11 09:41:30,123 - INFO - 模型参数量：115.6
+2026-04-11 09:41:30,235 - INFO - Batch配置：train=24, eval=4, grad_accum=6
+/home/tliang/tl_build/happygit/edu_llm/pretrain.py:288: FutureWarning: `tokenizer` is deprecated and will be removed in version 5.0.0 for `Trainer.__init__`. Use `processing_class` instead.
+  trainer = transformers.Trainer(
+2026-04-11 09:41:30,857 - INFO - 找到检查点，从 /home/tliang/tl_build/data/train_output/checkpoint-4200 继续训练
+2026-04-11 09:41:32,405 - INFO - Automatic SwanLab logging enabled, to disable set os.environ["SWANLAB_MODE"] = "disabled"
+2026-04-11 09:41:32,470 - INFO - Could not log the number of model parameters in SwanLab due to an AttributeError.
+ 64%|██████▍   | 4500/7034 [14:23<2:35:52,  3.69s/it]{'loss': 46.845, 'grad_norm': 5.53463077545166, 'learning_rate': 0.00017882538355295865, 'epoch': 1.21}
+{'loss': 46.8195, 'grad_norm': 7.016668319702148, 'learning_rate': 0.00017333621028370745, 'epoch': 1.22}
+{'loss': 46.859, 'grad_norm': 7.039000034332275, 'learning_rate': 0.0001678875375689074, 'epoch': 1.24}
+{'loss': 46.8657, 'grad_norm': 6.209787368774414, 'learning_rate': 0.00016248224387656543, 'epoch': 1.25}
+{'loss': 46.8185, 'grad_norm': 5.226704120635986, 'learning_rate': 0.00015712318475807422, 'epoch': 1.27}
+{'loss': 46.8189, 'grad_norm': 5.501615047454834, 'learning_rate': 0.00015181319133965968, 'epoch': 1.28}
+ 71%|███████   | 5000/7034 [1:00:14<2:07:57,  3.77s/it]{'eval_loss': 7.805367469787598, 'eval_runtime': 801.6399, 'eval_samples_per_second': 69.38, 'eval_steps_per_second': 17.346, 'epoch': 1.28}
+{'loss': 46.811, 'grad_norm': 8.156560897827148, 'learning_rate': 0.0001465550688267308, 'epoch': 1.29}
+{'loss': 46.8261, 'grad_norm': 6.378696918487549, 'learning_rate': 0.0001413515950219232, 'epoch': 1.31}
+{'loss': 46.8475, 'grad_norm': 5.418851375579834, 'learning_rate': 0.00013620551885762017, 'epoch': 1.32}
+{'loss': 46.8504, 'grad_norm': 7.461386203765869, 'learning_rate': 0.0001311195589437244, 'epoch': 1.34}
+{'loss': 46.8481, 'grad_norm': 5.154213905334473, 'learning_rate': 0.00012609640213144947, 'epoch': 1.35}
+{'loss': 46.7587, 'grad_norm': 5.769362449645996, 'learning_rate': 0.00012113870209388836, 'epoch': 1.36}
+{'loss': 46.8738, 'grad_norm': 5.529599189758301, 'learning_rate': 0.00011624907792411069, 'epoch': 1.38}
+{'loss': 46.7402, 'grad_norm': 8.931978225708008, 'learning_rate': 0.00011143011275152696, 'epoch': 1.39}
+{'loss': 46.7832, 'grad_norm': 5.916167259216309, 'learning_rate': 0.00010668435237725237, 'epoch': 1.41}
+{'loss': 46.7538, 'grad_norm': 6.1514081954956055, 'learning_rate': 0.00010201430392919146, 'epoch': 1.42}
+ 78%|███████▊  | 5500/7034 [1:44:45<1:38:54,  3.87s/it]{'eval_loss': 7.799145698547363, 'eval_runtime': 787.4558, 'eval_samples_per_second': 70.63, 'eval_steps_per_second': 17.658, 'epoch': 1.42}
+{'loss': 46.7524, 'grad_norm': 6.055618762969971, 'learning_rate': 9.742243453755201e-05, 'epoch': 1.44}
+{'loss': 46.8239, 'grad_norm': 6.3506293296813965, 'learning_rate': 9.291117003149041e-05, 'epoch': 1.45}
+{'loss': 46.8159, 'grad_norm': 6.602507591247559, 'learning_rate': 8.848289365757517e-05, 'epoch': 1.46}
+{'loss': 46.7851, 'grad_norm': 5.578679084777832, 'learning_rate': 8.413994482074672e-05, 'epoch': 1.48}
+{'loss': 46.7191, 'grad_norm': 4.3272624015808105, 'learning_rate': 7.988461784843762e-05, 'epoch': 1.49}
+{'loss': 46.8122, 'grad_norm': 4.832915782928467, 'learning_rate': 7.571916077850768e-05, 'epoch': 1.51}
+{'loss': 46.7551, 'grad_norm': 5.262372970581055, 'learning_rate': 7.164577417163226e-05, 'epoch': 1.52}
+{'loss': 46.754, 'grad_norm': 4.222165107727051, 'learning_rate': 6.766660994877278e-05, 'epoch': 1.54}
+{'loss': 46.7179, 'grad_norm': 4.900961399078369, 'learning_rate': 6.378377025434293e-05, 'epoch': 1.55}
+{'loss': 46.7731, 'grad_norm': 4.779627799987793, 'learning_rate': 5.99993063456708e-05, 'epoch': 1.56}
+ 85%|████████▌ | 6000/7034 [2:29:20<1:04:24,  3.74s/it]{'eval_loss': 7.793632507324219, 'eval_runtime': 800.9931, 'eval_samples_per_second': 69.436, 'eval_steps_per_second': 17.36, 'epoch': 1.56}
+{'loss': 46.7654, 'grad_norm': 4.480677604675293, 'learning_rate': 5.631521750934501e-05, 'epoch': 1.58}
+{'loss': 46.7642, 'grad_norm': 4.793179988861084, 'learning_rate': 5.273345000501531e-05, 'epoch': 1.59}
+{'loss': 46.7148, 'grad_norm': 4.586446762084961, 'learning_rate': 4.925589603720704e-05, 'epoch': 1.61}
+{'loss': 46.7606, 'grad_norm': 5.169690132141113, 'learning_rate': 4.588439275569267e-05, 'epoch': 1.62}
+{'loss': 46.7095, 'grad_norm': 5.368334770202637, 'learning_rate': 4.262072128494757e-05, 'epoch': 1.63}
+{'loss': 46.7654, 'grad_norm': 4.720780372619629, 'learning_rate': 3.946660578320344e-05, 'epoch': 1.65}
+{'loss': 46.7335, 'grad_norm': 4.449097156524658, 'learning_rate': 3.6423712531596266e-05, 'epoch': 1.66}
+{'loss': 46.6423, 'grad_norm': 4.322765827178955, 'learning_rate': 3.3493649053890325e-05, 'epoch': 1.68}
+{'loss': 46.7327, 'grad_norm': 5.44476318359375, 'learning_rate': 3.067796326724273e-05, 'epoch': 1.69}
+{'loss': 46.7481, 'grad_norm': 4.460992813110352, 'learning_rate': 2.7978142664457195e-05, 'epoch': 1.71}
+ 92%|█████████▏| 6500/7034 [3:15:31<33:30,  3.76s/it]{'eval_loss': 7.789861679077148, 'eval_runtime': 815.5255, 'eval_samples_per_second': 68.199, 'eval_steps_per_second': 17.05, 'epoch': 1.71}
+{'loss': 46.7723, 'grad_norm': 4.781144618988037, 'learning_rate': 2.539561352816e-05, 'epoch': 1.72}
+{'loss': 46.7317, 'grad_norm': 3.748154878616333, 'learning_rate': 2.293174017731181e-05, 'epoch': 1.73}
+{'loss': 46.7947, 'grad_norm': 3.9685423374176025, 'learning_rate': 2.0587824246454585e-05, 'epoch': 1.75}
+{'loss': 46.7629, 'grad_norm': 4.738541603088379, 'learning_rate': 1.836510399807348e-05, 'epoch': 1.76}
+{'loss': 46.7174, 'grad_norm': 4.3068766593933105, 'learning_rate': 1.626475366843816e-05, 'epoch': 1.78}
+{'loss': 46.7515, 'grad_norm': 4.264101982116699, 'learning_rate': 1.428788284726773e-05, 'epoch': 1.79}
+{'loss': 46.7513, 'grad_norm': 3.64286208152771, 'learning_rate': 1.243553589154775e-05, 'epoch': 1.81}
+{'loss': 46.7095, 'grad_norm': 4.631508827209473, 'learning_rate': 1.0708691373809253e-05, 'epoch': 1.82}
+{'loss': 46.6906, 'grad_norm': 4.386429309844971, 'learning_rate': 9.108261565160757e-06, 'epoch': 1.83}
+{'loss': 46.805, 'grad_norm': 4.137887477874756, 'learning_rate': 7.635091953346107e-06, 'epoch': 1.85}
+100%|█████████▉| 7000/7034 [4:00:22<02:09,  3.80s/it]{'eval_loss': 7.785808563232422, 'eval_runtime': 796.2388, 'eval_samples_per_second': 69.851, 'eval_steps_per_second': 17.463, 'epoch': 1.85}
+{'loss': 46.7791, 'grad_norm': 3.640258550643921, 'learning_rate': 6.289960796083904e-06, 'epoch': 1.86}
+{'loss': 46.7827, 'grad_norm': 3.8501787185668945, 'learning_rate': 5.073578709923088e-06, 'epoch': 1.88}
+{'loss': 46.7432, 'grad_norm': 3.5497281551361084, 'learning_rate': 3.9865882948329216e-06, 'epoch': 1.89}
+{'loss': 46.7103, 'grad_norm': 3.7680561542510986, 'learning_rate': 3.029563794725104e-06, 'epoch': 1.91}
+{'loss': 46.7404, 'grad_norm': 3.47029447555542, 'learning_rate': 2.2030107940877733e-06, 'epoch': 1.92}
+{'loss': 46.6847, 'grad_norm': 3.868952512741089, 'learning_rate': 1.5073659508910987e-06, 'epoch': 1.93}
+{'loss': 46.6973, 'grad_norm': 3.810741901397705, 'learning_rate': 9.429967659064231e-07, 'epoch': 1.95}
+{'loss': 46.7192, 'grad_norm': 4.328560829162598, 'learning_rate': 5.102013885598111e-07, 'epoch': 1.96}
+{'loss': 46.7871, 'grad_norm': 3.606649875640869, 'learning_rate': 2.0920845942348775e-07, 'epoch': 1.98}
+{'loss': 46.6918, 'grad_norm': 3.5038840770721436, 'learning_rate': 4.0176989427653796e-08, 'epoch': 1.99}
+100%|█████████▉| 7033/7034 [4:15:55<00:02,  2.18s/it]
+2026-04-11 13:57:28,562 - INFO - ✅ 模型已保存至：/home/tliang/tl_build/data/model_weights
+2026-04-11 13:57:28,562 - INFO -
+ 生成测试结果：
+2026-04-11 13:57:29,426 - INFO - 人工智能: 人工智能，，，，，，，，，，，，，，，，，，，，，，，，，，，，，，，，，，，，，，，，，，，，，，，，，，，，，，，，，，，，，，，，
+2026-04-11 13:57:30,182 - INFO - 牛顿: 牛顿，，，，，，，，，，，，，，，，，，，，，，，，，，，，，，，，，，，，，，，，，，，，，，，，，，，，，，，，，，，，，，，，
+2026-04-11 13:57:30,893 - INFO - 北京市: 北京市，，，，，，，，，，，，，，，，，，，，，，，，，，，，，，，，，，，，，，，，，，，，，，，，，，，，，，，，，，，，，，，，
+2026-04-11 13:57:31,608 - INFO - 亚洲历史: 亚洲历史，，，，，，，，，，，，，，，，，，，，，，，，，，，，，，，，，，，，，，，，，，，，，，，，，，，，，，，，，，，，，，，，
+2026-04-11 13:57:31,608 - INFO - 训练任务完成！
+{'eval_loss': 7.7865214347839355, 'eval_runtime': 808.9963, 'eval_samples_per_second': 68.749, 'eval_steps_per_second': 17.188, 'epoch': 1.99}
+{'train_runtime': 15355.5886, 'train_samples_per_second': 65.957, 'train_steps_per_second': 0.458, 'train_loss': 18.843906783894898, 'epoch': 2.0}
+
