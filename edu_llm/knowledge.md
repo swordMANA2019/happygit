@@ -216,3 +216,91 @@ T: 128 -> 512  => attention memory ~16x
 ```
 
 So on 2GB GPUs, reduce `T` first, then tune batch/grad_accum.
+
+---
+
+## Appendix: BOS / EOS in Chinese Pretraining
+
+### What BOS and EOS Mean
+
+- `bos_token_id`: beginning-of-sequence token ID, marks sequence start.
+- `eos_token_id`: end-of-sequence token ID, marks sequence end.
+
+In decoder-only models, these tokens are usually applied in the data and generation pipeline, not via special logic in `model.forward()`.
+
+### Why `model.forward()` Does Not Special-Handle BOS/EOS
+
+`DecoderOnlyModel` takes token IDs and computes logits. It does not branch on token type like:
+
+- `if token == bos_token_id: ...`
+- `if token == eos_token_id: ...`
+
+So BOS/EOS are used by sequence construction and stopping rules, then consumed as normal tokens by the model.
+
+### Chinese Pretraining Scenarios
+
+#### 1) Multi-document pretraining (most common)
+
+You have two corpus samples:
+
+- Doc A: `牛顿提出了万有引力定律。`
+- Doc B: `细胞由细胞膜和细胞核组成。`
+
+If concatenated directly (no boundary):
+
+`...万有引力定律。细胞由...`
+
+The model may learn false cross-document continuity.
+
+With `EOS`:
+
+`牛顿提出了万有引力定律。<eos>细胞由细胞膜和细胞核组成。<eos>`
+
+Now the model learns clear sample boundaries.
+
+`BOS` is optional:
+
+- `<bos>牛顿提出了万有引力定律。<eos>`
+- `<bos>细胞由细胞膜和细胞核组成。<eos>`
+
+#### 2) Instruction/chat fine-tuning
+
+Chinese sample:
+
+- User: `请解释光合作用。`
+- Assistant: `光合作用是绿色植物利用光能合成有机物的过程。`
+
+Formatted:
+
+`<bos><user>请解释光合作用。</user><assistant>光合作用是...过程。<eos>`
+
+`EOS` is important for both:
+
+- teaching answer boundary during training
+- stopping generation during inference
+
+#### 3) Generation stop condition
+
+Prompt:
+
+`地球为什么有四季？`
+
+Without EOS-stop, generation may continue to `max_new_tokens`.  
+With EOS-stop, output is usually cleaner and shorter.
+
+#### 4) Sample packing
+
+To improve throughput, short texts are often packed:
+
+`勾股定理描述直角三角形边长关系。<eos>元素周期表按原子序数排列。<eos>`
+
+This uses context window efficiently while preventing sample contamination.
+
+#### 5) When BOS can be omitted
+
+For Chinese continuation tasks with non-empty prompts:
+
+`请续写：量子力学是研究微观粒子行为的理论，`
+
+Many models work without explicit BOS.  
+But EOS is still strongly recommended (boundary + stop).
