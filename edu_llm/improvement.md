@@ -47,3 +47,35 @@
 ## Practical conclusion
 
 Treat the current checkpoint as an intermediate result: training is stable, but language quality has not converged to a good level yet.
+
+## Implemented now (data quality pipeline)
+
+The following data-quality improvements have been implemented in `pretrain.py` before tokenization:
+
+1. **Text normalization**
+   - Trim leading/trailing whitespace.
+   - Collapse repeated whitespace to single spaces.
+   - Compress long repeated punctuation (e.g. `!!!!!!` -> `!!!`, `。。。。。` -> `。。。`).
+
+2. **Low-quality sample filtering**
+   - Remove empty texts.
+   - Remove very short samples using `PRETRAIN_MIN_TEXT_CHARS` (default: `20`).
+   - Remove punctuation-heavy samples using `PRETRAIN_MAX_PUNC_RATIO` (default: `0.40`).
+
+3. **Exact deduplication (per split)**
+   - Deduplicate normalized samples with SHA1 hash of text.
+   - Keep only the first occurrence in each split.
+
+4. **Traceable cleaning logs**
+   - For each split (`train`/`test`), logs now include:
+   - `before`, `after`, `removed`, `min_chars`, `max_punc_ratio`.
+
+5. **Cache refresh to avoid stale token cache**
+   - Token cache schema version is bumped to `full_chunk_ctx_v2_quality`.
+   - This forces rebuild from cleaned data instead of reusing old cached tokens.
+
+## Why this matters
+
+- Reduces repetitive punctuation patterns in training data.
+- Improves signal quality and sample diversity (via dedup).
+- Makes data cleaning measurable and reproducible from logs.

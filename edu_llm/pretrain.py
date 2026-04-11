@@ -3,6 +3,7 @@ import hashlib
 import inspect
 import json
 import os
+import re
 import shutil
 import traceback
 import logging
@@ -50,7 +51,11 @@ def parse_args():
 
 # ===================== 路径配置 =====================
 MODEL_ID = os.environ.get("MODEL_ID", "Qwen/Qwen2-0.5B")
-_TOKEN_CACHE_SCHEMA = "full_chunk_ctx_v1"
+_TOKEN_CACHE_SCHEMA = "full_chunk_ctx_v2_quality"
+
+_RE_WS = re.compile(r"\s+")
+_RE_REPEAT_PUNC = re.compile(r"([，。！？,.!?；;：:])\1{3,}")
+_PUNC_SET = set("，。！？,.!?；;：:")
 
 def get_data_paths(data_dir: str):
     """统一管理所有路径"""
@@ -147,6 +152,57 @@ def _choose_training_batch_hyperparams(cmd_train_bs=None, cmd_eval_bs=None, cmd_
 
     return train_bs, eval_bs, grad_accum, total_gb, dev_name
 
+
+def _normalize_text(text: str) -> str:
+    t = (text or "").strip()
+    if not t:
+        return ""
+    t = _RE_WS.sub(" ", t)
+    # 压缩超长连续标点，减少模型学到“标点刷屏”模式。
+    t = _RE_REPEAT_PUNC.sub(lambda m: m.group(1) * 3, t)
+    return t
+
+
+def _punct_ratio(text: str) -> float:
+    if not text:
+        return 1.0
+    p = sum(1 for ch in text if ch in _PUNC_SET)
+    return p / len(text)
+
+
+def _clean_and_filter_raw_data(raw_data: datasets.DatasetDict) -> datasets.DatasetDict:
+    """轻量数据清洗：规范文本、过滤低质量样本、去重。"""
+    min_chars = int(os.environ.get("PRETRAIN_MIN_TEXT_CHARS", "20"))
+    max_punc_ratio = float(os.environ.get("PRETRAIN_MAX_PUNC_RATIO", "0.40"))
+
+    cleaned = datasets.DatasetDict()
+    for split_name in raw_data.keys():
+        ds = raw_data[split_name]
+        before_cnt = len(ds)
+
+        def _normalize_batch(batch):
+            return {"text": [_normalize_text(t) for t in batch["text"]]}
+
+        ds = ds.map(_normalize_batch, batched=True)
+        ds = ds.filter(lambda e: bool(e["text"]) and len(e["text"]) >= min_chars and _punct_ratio(e["text"]) <= max_punc_ratio)
+
+        seen = set()
+
+        def _not_dup(e):
+            h = hashlib.sha1(e["text"].encode("utf-8")).hexdigest()
+            if h in seen:
+                return False
+            seen.add(h)
+            return True
+
+        ds = ds.filter(_not_dup)
+        after_cnt = len(ds)
+        logger.info(
+            f"数据清洗[{split_name}]：before={before_cnt}, after={after_cnt}, removed={before_cnt-after_cnt}, min_chars={min_chars}, max_punc_ratio={max_punc_ratio}"
+        )
+        cleaned[split_name] = ds
+    return cleaned
+
 # ===================== 数据集处理 =====================
 def _data_mtime_ns(st: os.stat_result) -> int:
     return int(getattr(st, "st_mtime_ns", int(st.st_mtime * 1e9)))
@@ -238,6 +294,7 @@ def main():
         # 加载数据
         raw_datasets = datasets.load_dataset("json", data_files=paths["data_json"])
         raw_data = raw_datasets["train"].train_test_split(test_size=0.1, seed=2333)
+        raw_data = _clean_and_filter_raw_data(raw_data)
         logger.info(f"数据集加载完成：{raw_data}")
 
         # 加载Tokenizer
@@ -278,7 +335,7 @@ def main():
             per_device_train_batch_size=train_bs,
             per_device_eval_batch_size=eval_bs,
             gradient_accumulation_steps=grad_accum,
-            eval_strategy="steps", eval_steps=500, logging_steps=50,
+            eval_strategy="steps", eval_steps=100, logging_steps=50,
             num_train_epochs=2, weight_decay=0.1, warmup_steps=200,
             learning_rate=5e-4, lr_scheduler_type="cosine", optim="adamw_torch",
             # 核心：开启检查点 + 禁用safetensors（解决权重共享报错）
