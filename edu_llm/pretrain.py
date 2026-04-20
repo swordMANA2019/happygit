@@ -47,6 +47,14 @@ def parse_args():
     parser.add_argument("--eval_batch_size", type=int, default=None, help="单卡验证batch size")
     parser.add_argument("--grad_accum", type=int, default=None, help="梯度累积步数")
     parser.add_argument("--resume_weights_only", action="store_true", help="仅加载检查点模型权重继续训练（重置优化器和学习率调度）")
+    parser.add_argument("--context_length", type=int, default=int(os.environ.get("PRETRAIN_CONTEXT_LENGTH", "512")), help="训练序列长度")
+    parser.add_argument("--num_train_epochs", type=float, default=float(os.environ.get("PRETRAIN_NUM_TRAIN_EPOCHS", "4")), help="训练轮数")
+    parser.add_argument("--learning_rate", type=float, default=float(os.environ.get("PRETRAIN_LEARNING_RATE", "5e-4")), help="学习率")
+    parser.add_argument("--lr_scheduler_type", type=str, default=os.environ.get("PRETRAIN_LR_SCHEDULER_TYPE", "cosine_with_restarts"), help="学习率调度器")
+    parser.add_argument("--warmup_ratio", type=float, default=float(os.environ.get("PRETRAIN_WARMUP_RATIO", "0.03")), help="warmup比例（0~1）")
+    parser.add_argument("--eval_steps", type=int, default=int(os.environ.get("PRETRAIN_EVAL_STEPS", "50")), help="每多少步评估一次")
+    parser.add_argument("--save_steps", type=int, default=int(os.environ.get("PRETRAIN_SAVE_STEPS", "100")), help="每多少步保存一次检查点")
+    parser.add_argument("--max_grad_norm", type=float, default=float(os.environ.get("PRETRAIN_MAX_GRAD_NORM", "1.0")), help="梯度裁剪阈值")
     return parser.parse_args()
 
 # ===================== 路径配置 =====================
@@ -304,14 +312,15 @@ def main():
             return
 
         # 处理数据集
-        tokenized_datasets = _load_or_build_tokenized(paths["data_json"], paths["cache_root"], raw_data, tokenizer, 512)
+        context_length = max(128, args.context_length)
+        tokenized_datasets = _load_or_build_tokenized(paths["data_json"], paths["cache_root"], raw_data, tokenizer, context_length)
         tokenizer.pad_token = tokenizer.eos_token
         data_collator = transformers.DataCollatorForLanguageModeling(tokenizer, mlm=False)
 
         # 初始化模型
         config = Qwen2Config(
             vocab_size=len(tokenizer), hidden_size=512, intermediate_size=2048,
-            num_attention_heads=8, num_hidden_layers=12, max_position_embeddings=1024,
+            num_attention_heads=8, num_hidden_layers=12, max_position_embeddings=context_length,
             bos_token_id=tokenizer.bos_token_id, eos_token_id=tokenizer.eos_token_id
         )
         model = DecoderOnlyModel(config=config, dropout=0.1)
@@ -328,6 +337,10 @@ def main():
         )
         logger.info(f"Batch配置：train={train_bs}, eval={eval_bs}, grad_accum={grad_accum}")
         logger.info(f"有效batch（单卡）：effective_batch_size={train_bs * grad_accum}")
+        logger.info(
+            f"训练超参：context_length={context_length}, epochs={args.num_train_epochs}, lr={args.learning_rate}, "
+            f"lr_scheduler={args.lr_scheduler_type}, warmup_ratio={args.warmup_ratio}, eval_steps={args.eval_steps}, save_steps={args.save_steps}"
+        )
 
         # ===================== 训练参数（开启断点续训） =====================
         training_args = transformers.TrainingArguments(
@@ -335,12 +348,13 @@ def main():
             per_device_train_batch_size=train_bs,
             per_device_eval_batch_size=eval_bs,
             gradient_accumulation_steps=grad_accum,
-            eval_strategy="steps", eval_steps=100, logging_steps=50,
-            num_train_epochs=2, weight_decay=0.1, warmup_steps=200,
-            learning_rate=5e-4, lr_scheduler_type="cosine", optim="adamw_torch",
+            eval_strategy="steps", eval_steps=max(1, args.eval_steps), logging_steps=max(10, min(50, args.eval_steps)),
+            num_train_epochs=args.num_train_epochs, weight_decay=0.1, warmup_ratio=min(max(args.warmup_ratio, 0.0), 0.5),
+            learning_rate=args.learning_rate, lr_scheduler_type=args.lr_scheduler_type, optim="adamw_torch",
+            max_grad_norm=args.max_grad_norm,
             # 核心：开启检查点 + 禁用safetensors（解决权重共享报错）
             save_strategy="steps",      # 开启按步数保存
-            save_steps=100,             # 每100步生成检查点（快速生效）
+            save_steps=max(1, args.save_steps),
             save_safetensors=False,     # 禁用不兼容的safetensors（解决权重共享报错）
             save_only_model=False,      # 保存完整检查点（模型+优化器+训练状态）
             save_total_limit=3,         # 保留最新3个检查点
