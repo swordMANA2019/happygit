@@ -14,12 +14,8 @@ import datasets
 import torch
 import transformers
 from transformers import AutoTokenizer, Qwen2Config
-import swanlab
 
-try:
-    from swanlab.integration.transformers import SwanLabCallback
-except ImportError:
-    from swanlab.integration.huggingface import SwanLabCallback
+
 
 from model import DecoderOnlyModel
 
@@ -296,7 +292,7 @@ def main():
     train_exit_state = None
 
     try:
-        swanlab.init("WikiLLM", logdir=os.path.join(paths["train_output"], "swanlog"))
+        #swanlab.init("WikiLLM", logdir=os.path.join(paths["train_output"], "swanlog"))
         logger.info("开始训练任务...")
 
         # 加载数据
@@ -371,7 +367,8 @@ def main():
         trainer = transformers.Trainer(
             model=model, args=training_args, data_collator=data_collator,
             train_dataset=tokenized_datasets["train"], eval_dataset=tokenized_datasets["test"],
-            callbacks=[SwanLabCallback()], tokenizer=tokenizer
+            #callbacks=[SwanLabCallback()],
+            tokenizer=tokenizer
         )
 
         # ===================== 自动断点续训 =====================
