@@ -13,6 +13,7 @@ import torch
 import transformers
 from transformers import AutoTokenizer, Qwen2Config
 import swanlab
+from monitor import LayerMonitorCallback
 
 try:
     from swanlab.integration.transformers import SwanLabCallback
@@ -286,7 +287,7 @@ def main():
         trainer = transformers.Trainer(
             model=model, args=training_args, data_collator=data_collator,
             train_dataset=tokenized_datasets["train"], eval_dataset=tokenized_datasets["test"],
-            callbacks=[SwanLabCallback()], tokenizer=tokenizer
+            callbacks=[SwanLabCallback(),LayerMonitorCallback()], tokenizer=tokenizer
         )
 
         # ===================== 自动断点续训 =====================
