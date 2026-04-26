@@ -3,19 +3,22 @@ import hashlib
 import inspect
 import json
 import os
-import re
 import shutil
 import traceback
 import logging
 from datetime import datetime
-from enum import Enum
 
 import datasets
 import torch
 import transformers
 from transformers import AutoTokenizer, Qwen2Config
+import swanlab
+from monitor import LayerMonitorCallback
 
-
+try:
+    from swanlab.integration.transformers import SwanLabCallback
+except ImportError:
+    from swanlab.integration.huggingface import SwanLabCallback
 
 from model import DecoderOnlyModel
 
@@ -42,24 +45,11 @@ def parse_args():
     parser.add_argument("--train_batch_size", type=int, default=None, help="单卡训练batch size")
     parser.add_argument("--eval_batch_size", type=int, default=None, help="单卡验证batch size")
     parser.add_argument("--grad_accum", type=int, default=None, help="梯度累积步数")
-    parser.add_argument("--resume_weights_only", action="store_true", help="仅加载检查点模型权重继续训练（重置优化器和学习率调度）")
-    parser.add_argument("--context_length", type=int, default=int(os.environ.get("PRETRAIN_CONTEXT_LENGTH", "512")), help="训练序列长度")
-    parser.add_argument("--num_train_epochs", type=float, default=float(os.environ.get("PRETRAIN_NUM_TRAIN_EPOCHS", "4")), help="训练轮数")
-    parser.add_argument("--learning_rate", type=float, default=float(os.environ.get("PRETRAIN_LEARNING_RATE", "5e-4")), help="学习率")
-    parser.add_argument("--lr_scheduler_type", type=str, default=os.environ.get("PRETRAIN_LR_SCHEDULER_TYPE", "cosine_with_restarts"), help="学习率调度器")
-    parser.add_argument("--warmup_ratio", type=float, default=float(os.environ.get("PRETRAIN_WARMUP_RATIO", "0.03")), help="warmup比例（0~1）")
-    parser.add_argument("--eval_steps", type=int, default=int(os.environ.get("PRETRAIN_EVAL_STEPS", "50")), help="每多少步评估一次")
-    parser.add_argument("--save_steps", type=int, default=int(os.environ.get("PRETRAIN_SAVE_STEPS", "100")), help="每多少步保存一次检查点")
-    parser.add_argument("--max_grad_norm", type=float, default=float(os.environ.get("PRETRAIN_MAX_GRAD_NORM", "1.0")), help="梯度裁剪阈值")
     return parser.parse_args()
 
 # ===================== 路径配置 =====================
 MODEL_ID = os.environ.get("MODEL_ID", "Qwen/Qwen2-0.5B")
-_TOKEN_CACHE_SCHEMA = "full_chunk_ctx_v2_quality"
-
-_RE_WS = re.compile(r"\s+")
-_RE_REPEAT_PUNC = re.compile(r"([，。！？,.!?；;：:])\1{3,}")
-_PUNC_SET = set("，。！？,.!?；;：:")
+_TOKEN_CACHE_SCHEMA = "full_chunk_ctx_v1"
 
 def get_data_paths(data_dir: str):
     """统一管理所有路径"""
@@ -156,57 +146,6 @@ def _choose_training_batch_hyperparams(cmd_train_bs=None, cmd_eval_bs=None, cmd_
 
     return train_bs, eval_bs, grad_accum, total_gb, dev_name
 
-
-def _normalize_text(text: str) -> str:
-    t = (text or "").strip()
-    if not t:
-        return ""
-    t = _RE_WS.sub(" ", t)
-    # 压缩超长连续标点，减少模型学到“标点刷屏”模式。
-    t = _RE_REPEAT_PUNC.sub(lambda m: m.group(1) * 3, t)
-    return t
-
-
-def _punct_ratio(text: str) -> float:
-    if not text:
-        return 1.0
-    p = sum(1 for ch in text if ch in _PUNC_SET)
-    return p / len(text)
-
-
-def _clean_and_filter_raw_data(raw_data: datasets.DatasetDict) -> datasets.DatasetDict:
-    """轻量数据清洗：规范文本、过滤低质量样本、去重。"""
-    min_chars = int(os.environ.get("PRETRAIN_MIN_TEXT_CHARS", "20"))
-    max_punc_ratio = float(os.environ.get("PRETRAIN_MAX_PUNC_RATIO", "0.40"))
-
-    cleaned = datasets.DatasetDict()
-    for split_name in raw_data.keys():
-        ds = raw_data[split_name]
-        before_cnt = len(ds)
-
-        def _normalize_batch(batch):
-            return {"text": [_normalize_text(t) for t in batch["text"]]}
-
-        ds = ds.map(_normalize_batch, batched=True)
-        ds = ds.filter(lambda e: bool(e["text"]) and len(e["text"]) >= min_chars and _punct_ratio(e["text"]) <= max_punc_ratio)
-
-        seen = set()
-
-        def _not_dup(e):
-            h = hashlib.sha1(e["text"].encode("utf-8")).hexdigest()
-            if h in seen:
-                return False
-            seen.add(h)
-            return True
-
-        ds = ds.filter(_not_dup)
-        after_cnt = len(ds)
-        logger.info(
-            f"数据清洗[{split_name}]：before={before_cnt}, after={after_cnt}, removed={before_cnt-after_cnt}, min_chars={min_chars}, max_punc_ratio={max_punc_ratio}"
-        )
-        cleaned[split_name] = ds
-    return cleaned
-
 # ===================== 数据集处理 =====================
 def _data_mtime_ns(st: os.stat_result) -> int:
     return int(getattr(st, "st_mtime_ns", int(st.st_mtime * 1e9)))
@@ -278,27 +217,19 @@ def load_tokenizer(tokenizer_dir: str):
         return None
 
 # ===================== 主训练函数 =====================
-class TrainExitState(str, Enum):
-    COMPLETED = "completed"
-    INTERRUPTED = "interrupted"
-    FAILED = "failed"
-
-
 def main():
     args = parse_args()
     paths = get_data_paths(args.data_dir)
     global logger
     logger = init_logger(paths["log_dir"])  # 初始化日志
-    train_exit_state = None
 
     try:
-        #swanlab.init("WikiLLM", logdir=os.path.join(paths["train_output"], "swanlog"))
+        swanlab.init("WikiLLM", logdir=os.path.join(paths["train_output"], "swanlog"))
         logger.info("开始训练任务...")
 
         # 加载数据
         raw_datasets = datasets.load_dataset("json", data_files=paths["data_json"])
         raw_data = raw_datasets["train"].train_test_split(test_size=0.1, seed=2333)
-        raw_data = _clean_and_filter_raw_data(raw_data)
         logger.info(f"数据集加载完成：{raw_data}")
 
         # 加载Tokenizer
@@ -308,15 +239,14 @@ def main():
             return
 
         # 处理数据集
-        context_length = max(128, args.context_length)
-        tokenized_datasets = _load_or_build_tokenized(paths["data_json"], paths["cache_root"], raw_data, tokenizer, context_length)
+        tokenized_datasets = _load_or_build_tokenized(paths["data_json"], paths["cache_root"], raw_data, tokenizer, 512)
         tokenizer.pad_token = tokenizer.eos_token
         data_collator = transformers.DataCollatorForLanguageModeling(tokenizer, mlm=False)
 
         # 初始化模型
         config = Qwen2Config(
             vocab_size=len(tokenizer), hidden_size=512, intermediate_size=2048,
-            num_attention_heads=8, num_hidden_layers=12, max_position_embeddings=context_length,
+            num_attention_heads=8, num_hidden_layers=12, max_position_embeddings=1024,
             bos_token_id=tokenizer.bos_token_id, eos_token_id=tokenizer.eos_token_id
         )
         model = DecoderOnlyModel(config=config, dropout=0.1)
@@ -332,11 +262,6 @@ def main():
             args.train_batch_size, args.eval_batch_size, args.grad_accum
         )
         logger.info(f"Batch配置：train={train_bs}, eval={eval_bs}, grad_accum={grad_accum}")
-        logger.info(f"有效batch（单卡）：effective_batch_size={train_bs * grad_accum}")
-        logger.info(
-            f"训练超参：context_length={context_length}, epochs={args.num_train_epochs}, lr={args.learning_rate}, "
-            f"lr_scheduler={args.lr_scheduler_type}, warmup_ratio={args.warmup_ratio}, eval_steps={args.eval_steps}, save_steps={args.save_steps}"
-        )
 
         # ===================== 训练参数（开启断点续训） =====================
         training_args = transformers.TrainingArguments(
@@ -344,77 +269,51 @@ def main():
             per_device_train_batch_size=train_bs,
             per_device_eval_batch_size=eval_bs,
             gradient_accumulation_steps=grad_accum,
-            eval_strategy="steps", eval_steps=max(1, args.eval_steps), logging_steps=max(10, min(50, args.eval_steps)),
-            num_train_epochs=args.num_train_epochs, weight_decay=0.1, warmup_ratio=min(max(args.warmup_ratio, 0.0), 0.5),
-            learning_rate=args.learning_rate, lr_scheduler_type=args.lr_scheduler_type, optim="adamw_torch",
-            max_grad_norm=args.max_grad_norm,
+            eval_strategy="steps", eval_steps=500, logging_steps=50,
+            num_train_epochs=2, weight_decay=0.1, warmup_steps=200,
+            learning_rate=5e-4, lr_scheduler_type="cosine", optim="adamw_torch",
             # 核心：开启检查点 + 禁用safetensors（解决权重共享报错）
             save_strategy="steps",      # 开启按步数保存
-            save_steps=max(1, args.save_steps),
+            save_steps=100,             # 每100步生成检查点（快速生效）
             save_safetensors=False,     # 禁用不兼容的safetensors（解决权重共享报错）
             save_only_model=False,      # 保存完整检查点（模型+优化器+训练状态）
             save_total_limit=3,         # 保留最新3个检查点
             bf16=use_bf16, fp16=use_fp16,
             dataloader_num_workers=2 if (_cuda and vram_gb>=6) else 0,
             dataloader_pin_memory=_cuda and vram_gb >= 6,
-            load_best_model_at_end=True,
-            metric_for_best_model="eval_loss",
-            greater_is_better=False,
-            logging_first_step=True,
         )
 
         # 初始化Trainer
         trainer = transformers.Trainer(
             model=model, args=training_args, data_collator=data_collator,
             train_dataset=tokenized_datasets["train"], eval_dataset=tokenized_datasets["test"],
-            #callbacks=[SwanLabCallback()],
-            tokenizer=tokenizer
+            callbacks=[SwanLabCallback(),LayerMonitorCallback()], tokenizer=tokenizer
         )
 
         # ===================== 自动断点续训 =====================
-        logger.info(">>> 进入训练阶段")
         latest_ckpt = get_latest_checkpoint(paths["train_output"])
         if latest_ckpt:
-            if args.resume_weights_only:
-                logger.info(f"找到检查点，按仅权重模式加载：{latest_ckpt}")
-                if load_model_weights(model, latest_ckpt):
-                    logger.info("仅加载模型权重完成：优化器/学习率调度将重新开始")
-                train_result = trainer.train()
-            else:
-                logger.info(f"找到检查点，从 {latest_ckpt} 继续训练")
-                train_result = trainer.train(resume_from_checkpoint=latest_ckpt)
+            logger.info(f"找到检查点，从 {latest_ckpt} 继续训练")
+            trainer.train(resume_from_checkpoint=latest_ckpt)
         else:
             # 无检查点则尝试加载手动保存的模型
             if load_model_weights(model, paths["model_weights"]):
                 logger.info("从保存的模型权重开始训练")
-            train_result = trainer.train()
-        logger.info(f">>> 训练阶段完成（global_step={trainer.state.global_step}, loss={getattr(train_result, 'training_loss', 'N/A')}）")
-        if trainer.state.best_metric is not None:
-            logger.info(f">>> best_eval_loss={trainer.state.best_metric} @ {trainer.state.best_model_checkpoint}")
+            trainer.train()
 
         # 保存最终模型
         _save_decoder_checkpoint(model, config, paths["model_weights"])
 
         # 生成测试
-        logger.info(">>> 生成测试结果：")
+        logger.info("\n 生成测试结果：")
         device = next(model.parameters()).device
         for prompt in ["人工智能", "牛顿", "北京市", "亚洲历史"]:
             res = _greedy_generate(model, tokenizer, prompt, device=device)
             logger.info(f"{prompt}: {res}")
 
         logger.info("训练任务完成！")
-        train_exit_state = TrainExitState.COMPLETED
 
-    except KeyboardInterrupt:
-        train_exit_state = TrainExitState.INTERRUPTED
-        logger.warning("训练被手动中断（KeyboardInterrupt）")
-        raise
-    except SystemExit as e:
-        train_exit_state = TrainExitState.INTERRUPTED
-        logger.warning(f"训练进程收到退出信号（SystemExit: code={e.code}）")
-        raise
     except Exception as e:
-        train_exit_state = TrainExitState.FAILED
         # ===================== 异常捕获：保存堆栈 =====================
         error_msg = f"训练异常中断：{str(e)}"
         stack_msg = traceback.format_exc()
@@ -426,15 +325,6 @@ def main():
         with open(error_file, "w", encoding="utf-8") as f:
             f.write(error_msg + "\n" + stack_msg)
         raise  # 抛出异常便于查看
-    finally:
-        if train_exit_state == TrainExitState.COMPLETED:
-            logger.info(">>> 进程退出状态：训练完整结束，已完成生成测试")
-        elif train_exit_state == TrainExitState.INTERRUPTED:
-            logger.warning(">>> 进程退出状态：训练被中断，未完成完整收尾")
-        elif train_exit_state == TrainExitState.FAILED:
-            logger.critical(">>> 进程退出状态：训练异常失败，请查看 error_*.log")
-        else:
-            logger.warning(">>> 进程退出状态：训练未进入完整流程（早期退出）")
 
 if __name__ == '__main__':
     main()
