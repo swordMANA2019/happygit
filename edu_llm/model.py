@@ -60,53 +60,58 @@ class DecoderLayer(nn.Module):
 class DecoderOnlyModel(nn.Module):
     def __init__(
         self,
-        vocab_size = None,
-        d_model=HIDDEN_SIZE,
+        vocab_size:int = None,
+        d_model = HIDDEN_SIZE,
         nhead = N_HEAD,
         num_layers = N_LAYERS,
-        intermediate_size=None,
+        intermediate_size = None,
         max_seq_len = 1024,
-        dropout= 0.1,
-        config=None,
+        dropout = 0.1,
+        config = None,
     ):
         super().__init__()
+        _vocab_size = vocab_size
+        _d_model = d_model
+        _nhead = nhead
+        _nlayers = num_layers
+        _intermediate_size = intermediate_size
+        _max_seq_len = max_seq_len
+        _dropout = dropout
         if config is not None:
-            vocab_size = config.vocab_size
-            d_model = config.hidden_size
-            nhead = config.num_attention_heads
-            num_layers = config.num_hidden_layers
-            intermediate_size = getattr(config, "intermediate_size", None)
-            max_seq_len = config.max_position_embeddings
+            _vocab_size = config.vocab_size
+            _d_model = config.hidden_size
+            _nhead = config.num_attention_heads
+            _nlayers = config.num_hidden_layers
+            _ntermediate_size = getattr(config, "intermediate_size", None)
+            _max_seq_len = config.max_position_embeddings
             # Align decoder dropout with HF config when provided.
-            dropout = getattr(config, "attention_dropout", dropout)
+            _dropout = getattr(config, "attention_dropout", dropout)
             self.bos_token_id = getattr(config, "bos_token_id", None)
             self.eos_token_id = getattr(config, "eos_token_id", None)
         else:
             self.bos_token_id = None
             self.eos_token_id = None
-
-        if vocab_size is None:
+        if _vocab_size is None:
             raise ValueError("vocab_size must be provided when config is None")
         if intermediate_size is None:
-            intermediate_size = d_model * 4
-
-        self.vocab_size = vocab_size
+            _intermediate_size = d_model * 4
+        self.vocab_size = _vocab_size
         self.config = config if config is not None else None
-        self.emb = nn.Embedding(vocab_size, d_model)
-        self.pos = PositionalEncoding(d_model, max_len=max_seq_len)
-        self.dropout = nn.Dropout(dropout)
+        self.emb = nn.Embedding(_vocab_size, _d_model)
+        self.pos = PositionalEncoding(_d_model, max_len=_max_seq_len)
+        self.dropout = nn.Dropout(_dropout)
         self.layers = nn.ModuleList(
             [
-                DecoderLayer(d_model, nhead, intermediate_size=intermediate_size, dropout=dropout)
+                DecoderLayer(_d_model, _nhead, intermediate_size=_intermediate_size, dropout=dropout)
                 for _ in range(num_layers)
             ]
         )
-        self.fc = nn.Linear(d_model, vocab_size)
+        self.fc = nn.Linear(_d_model, _vocab_size)
         # Tie input/output embeddings to improve sample efficiency.
         self.fc.weight = self.emb.weight
         self.register_buffer(
             "causal_mask",
-            torch.triu(torch.ones(max_seq_len, max_seq_len, dtype=torch.bool), diagonal=1),
+            torch.triu(torch.ones(_max_seq_len, _max_seq_len, dtype=torch.bool), diagonal=1),
             persistent=False,
         )
 

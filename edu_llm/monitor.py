@@ -22,18 +22,10 @@ def calc_cos_sim(h1, h2):
 class LayerMonitorCallback(TrainerCallback):
     # ✅ 固定名字：on_step_end
     def on_step_end(self, args, state, control, outputs=None, **kwargs):
-        # 只在主GPU执行
-        if args.local_rank != 0:
-            return
-
-        # 每50步记录一次（和你logging_steps一致）
-        if state.global_step % args.logging_steps != 0:
-            return
-
         # 拿训练已经算好的结果
         if outputs is None:
             return
-
+        print("log on step")
         hidden_states = outputs.hidden_states
         attentions = outputs.attentions
 

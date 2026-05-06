@@ -1,9 +1,6 @@
 import argparse
 import hashlib
-import inspect
-import json
 import os
-import shutil
 import traceback
 import logging
 from datetime import datetime
@@ -11,9 +8,11 @@ from datetime import datetime
 import datasets
 import torch
 import transformers
-from transformers import AutoTokenizer, Qwen2Config
+from transformers import Qwen2Config
 import swanlab
 from monitor import LayerMonitorCallback
+from common import get_data_paths, load_tokenizer, MODEL_ID, clean_data
+
 
 try:
     from swanlab.integration.transformers import SwanLabCallback
@@ -48,19 +47,9 @@ def parse_args():
     return parser.parse_args()
 
 # ===================== 路径配置 =====================
-MODEL_ID = os.environ.get("MODEL_ID", "Qwen/Qwen2-0.5B")
+
 _TOKEN_CACHE_SCHEMA = "full_chunk_ctx_v1"
 
-def get_data_paths(data_dir: str):
-    """统一管理所有路径"""
-    return {
-        "data_json": os.path.join(data_dir, "wikipedia-zh-cn-20240820.json"),
-        "tokenizer_dir": os.path.join(data_dir, "tokenizer"),
-        "cache_root": data_dir,
-        "train_output": os.path.join(data_dir, "train_output"),  # 训练检查点
-        "model_weights": os.path.join(data_dir, "model_weights"),  # 最终模型
-        "log_dir": os.path.join(data_dir, "train_logs"),  # 日志目录
-    }
 
 # ===================== 断点续训核心（修复版） =====================
 def is_checkpoint_valid(ckpt_dir):
@@ -180,7 +169,8 @@ def _load_or_build_tokenized(data_json: str, cache_root: str, raw_data, tokenize
 
     logger.info("正在处理数据...")
     os.makedirs(root, exist_ok=True)
-    tokenized_datasets = raw_data.map(tokenize, batched=True, remove_columns=raw_data["train"].column_names)
+    tokenized_datasets = raw_data.map(tokenize, batched=True,
+                                      remove_columns=raw_data["train"].column_names)
     if use_cache:
         tokenized_datasets.save_to_disk(ds_path)
     return tokenized_datasets
@@ -205,16 +195,7 @@ def _greedy_generate(model, tokenizer, prompt: str, max_new_tokens=64, device=No
             break
     return tokenizer.decode(input_ids[0], skip_special_tokens=True)
 
-def load_tokenizer(tokenizer_dir: str):
-    os.makedirs(tokenizer_dir, exist_ok=True)
-    try:
-        if not os.listdir(tokenizer_dir):
-            tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, trust_remote_code=True)
-            tokenizer.save_pretrained(tokenizer_dir)
-        return AutoTokenizer.from_pretrained(tokenizer_dir, local_files_only=True)
-    except Exception as e:
-        logger.error(f"❌ Tokenizer加载失败：{e}")
-        return None
+
 
 # ===================== 主训练函数 =====================
 def main():
@@ -230,8 +211,9 @@ def main():
         # 加载数据
         raw_datasets = datasets.load_dataset("json", data_files=paths["data_json"])
         raw_data = raw_datasets["train"].train_test_split(test_size=0.1, seed=2333)
-        logger.info(f"数据集加载完成：{raw_data}")
-
+        # logger.info(f"数据集加载完成：{raw_data}")
+        raw_data = clean_data(raw_data)
+        # logger.info(f"加载清洗后的数据：{raw_data}")
         # 加载Tokenizer
         tokenizer = load_tokenizer(paths["tokenizer_dir"])
         if not tokenizer:
@@ -239,7 +221,8 @@ def main():
             return
 
         # 处理数据集
-        tokenized_datasets = _load_or_build_tokenized(paths["data_json"], paths["cache_root"], raw_data, tokenizer, 512)
+        tokenized_datasets = _load_or_build_tokenized(
+            paths["data_json"], paths["cache_root"], raw_data, tokenizer, 512)
         tokenizer.pad_token = tokenizer.eos_token
         data_collator = transformers.DataCollatorForLanguageModeling(tokenizer, mlm=False)
 
@@ -254,7 +237,8 @@ def main():
 
         # 精度配置
         _cuda = torch.cuda.is_available()
-        use_bf16 = _cuda and torch.cuda.is_bf16_supported() and os.environ.get("PRETRAIN_USE_BF16", "") == "1"
+        use_bf16 = (_cuda and torch.cuda.is_bf16_supported()
+                    and os.environ.get("PRETRAIN_USE_BF16", "") == "1")
         use_fp16 = _cuda and not use_bf16
 
         # Batch配置
