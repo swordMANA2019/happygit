@@ -1,18 +1,36 @@
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from pycparser.ply.yacc import token
+from transformers import Qwen2Config
+import argparse
 import torch
+from common import get_data_paths,load_tokenizer
+from model import DecoderOnlyModel
 
-# ====================== 配置 =======================
-MODEL_PATH = "./edu_chat_model"  # 上面合并好的完整模型路径
 
-# 加载模型
-tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH)
-model = AutoModelForCausalLM.from_pretrained(
-    MODEL_PATH,
+# ===================== 命令行参数 =====================
+def parse_args():
+    parser = argparse.ArgumentParser(description="Decoder-Only LLM Eval Script")
+    parser.add_argument("--data_dir", type=str, required=True, help="数据根目录")
+    return parser.parse_args()
+
+'''
+model = Qwen2ForCausalLM.from_pretrained(
+    paths["model_weights"],
     torch_dtype=torch.bfloat16,
     device_map="auto",
     trust_remote_code=True
 )
-
+'''
+def load_model(path, tokenizer):
+    # 加载模型
+    state_dict = torch.load(path["model_weights"]+"/pytorch_model.bin")
+    config = Qwen2Config(
+                vocab_size=len(tokenizer), hidden_size=512, intermediate_size=2048,
+                num_attention_heads=8, num_hidden_layers=12, max_position_embeddings=1024,
+                bos_token_id=tokenizer.bos_token_id, eos_token_id=tokenizer.eos_token_id
+            )
+    model = DecoderOnlyModel(config=config, dropout=0.1)
+    model.load_state_dict(state_dict)
+    return model
 
 # 科教问答Prompt模板（和SFT保持一致）
 def build_prompt(instruction):
@@ -20,14 +38,16 @@ def build_prompt(instruction):
 
 
 # 生成回答
-def ask_edu_model(question):
-    prompt = build_prompt(question)
-    inputs = tokenizer(prompt, return_tensors="pt").to("cuda")
-
+def ask_edu_model(model:DecoderOnlyModel, question:str, tokenizer):
+    # prompt = build_prompt(question)
+    prompt = question
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model.to(device)
+    input_ids = torch.tensor([tokenizer.encode(prompt) or [tokenizer.eos_token_id]], device=device)
     with torch.no_grad():
         outputs = model.generate(
-            **inputs,
-            max_new_tokens=800,  # 科教回答长度
+            input_ids,
+            max_new_tokens=300,  # 科教回答长度
             temperature=0.3,  # 越低越严谨（科教必须低）
             top_p=0.9,
             repetition_penalty=1.05,
@@ -35,16 +55,22 @@ def ask_edu_model(question):
             eos_token_id=tokenizer.eos_token_id
         )
 
-    response = tokenizer.decode(outputs[0][len(inputs["input_ids"][0]):], skip_special_tokens=True)
+    response = tokenizer.decode(outputs[0][len(input_ids[0]):], skip_special_tokens=True)
     return response
 
 
 # ====================== 测试 =======================
 if __name__ == "__main__":
     print("✅ 科教大模型已加载，输入问题开始测试（输入q退出）")
+    # answer = ask_edu_model("2019冠状病毒")
+    # print("\n### 模型回答：\n", answer)
+    args = parse_args()
+    path = get_data_paths(args.data_dir)
+    tokenizer = load_tokenizer(path["tokenizer_dir"])
+    model = load_model(path, tokenizer)
     while True:
         question = input("\n请输入问题：")
         if question.lower() == "q":
             break
-        answer = ask_edu_model(question)
+        answer = ask_edu_model(model, question, tokenizer)
         print("\n### 模型回答：\n", answer)

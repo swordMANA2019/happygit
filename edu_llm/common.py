@@ -2,6 +2,7 @@ import os
 from transformers import AutoTokenizer
 import re
 import random
+import hashlib
 from collections import Counter
 import torch
 from transformers import Qwen2Config
@@ -10,6 +11,7 @@ import numpy as np
 from model import DecoderOnlyModel
 
 MODEL_ID = os.environ.get("MODEL_ID", "Qwen/Qwen2-0.5B")
+ids = ""
 
 def get_data_paths(data_dir: str):
     """统一管理所有路径"""
@@ -47,15 +49,34 @@ NGRAM_REPEAT_LIMIT = 3
 # ==============================================
 class DataCleaner:
     def __init__(self):
+        # 你原来的基础清洗
         self.multi_comma_en = re.compile(r",{2,}")
         self.multi_comma_cn = re.compile(r"，{2,}")
         self.multi_space = re.compile(r"\s+")
         self.control_char = re.compile(r"[\x00-\x1F\x7F]")
         self.multi_punc = re.compile(r"([。！？.!?]){2,}")
 
-    def clean(self, text: str) -> str:
+        # 清理 空括号 / 只有标点的括号
+        self.empty_brackets = re.compile(
+            r"\(\s*[，。！？、；：\s]*\)|"
+            r"（\s*[,，。！？、；：\s]*）"
+        )
+
+        # 质量过滤
+        self.noise_pattern = re.compile(r"[^\w\s\u4e00-\u9fff.,!?;:'\"，。！？、；：‘’“”（）]")
+        self.punctuation = set(".,!?;:'\"，。！？、；：‘’“”（）()")
+        self.url_pattern = re.compile(r"http[s]?://\S+|www\.\S+")
+
+        self._seen_hashes = set()
+
+    def _basic_clean(self, text: str) -> str:
         if not text:
             return ""
+        text = self.url_pattern.sub("", text)
+
+        # 只清理空括号 / 纯标点括号
+        text = self.empty_brackets.sub("", text)
+
         text = self.multi_comma_en.sub(",", text)
         text = self.multi_comma_cn.sub("，", text)
         text = self.multi_space.sub(" ", text)
@@ -63,7 +84,52 @@ class DataCleaner:
         text = self.multi_punc.sub(r"\1", text)
         return text.strip()
 
-cleaner = DataCleaner()
+    def _is_duplicate(self, text: str) -> bool:
+        norm_text = text.strip().lower()
+        h = hashlib.md5(norm_text.encode("utf-8")).hexdigest()
+        if h in self._seen_hashes:
+            return True
+        self._seen_hashes.add(h)
+        return False
+
+    def _calc_ngram_dup_ratio(self, text, n=2):
+        if len(text) < 2 * n:
+            return 0.0
+        ngrams = [text[i:i + n] for i in range(len(text) - n + 1)]
+        if not ngrams:
+            return 0.0
+        counter = Counter(ngrams)
+        return counter.most_common(1)[0][1] / len(ngrams)
+
+    def _is_high_quality(self, text: str) -> bool:
+        # 1. 过滤：太短的句子 → 没用
+        if len(text) < 20:
+            return False
+
+        # 2. 过滤：重复率太高 → 复读机垃圾
+        dup_ratio = self._calc_ngram_dup_ratio(text)
+        if dup_ratio > 0.35:
+            return False
+
+        # 3. 过滤：乱码/特殊符号太多 → 不是正常文字
+        noise = self.noise_pattern.findall(text)
+        if len(noise) / len(text) > 0.15:
+            return False
+
+        # 4. 过滤：标点太少 → 不像正常句子
+        punct = sum(1 for c in text if c in self.punctuation)
+        return punct / len(text) >= 0.02
+
+    def clean(self, text: str) -> str | None:
+        cleaned = self._basic_clean(text)
+        if not cleaned:
+            return None
+        if self._is_duplicate(cleaned):
+            return None
+        if not self._is_high_quality(cleaned):
+            return None
+        return cleaned
+
 
 # ==============================================
 # 过滤规则
@@ -84,9 +150,15 @@ def has_ngram_repeat(text, n=10, threshold=3):
 # ==============================================
 # 核心：给 datasets 用的清洗函数（map 专用）
 # ==============================================
+
 def clean_sample(sample):
-    text = sample["text"]
-    text = cleaner.clean(text)
+    cleaner = DataCleaner()
+    raw_text = sample["text"]
+    text = cleaner.clean(raw_text)
+    global ids
+    if text is None:
+        ids += sample["id"]
+        ids += "\n"
     sample["text"] = text
     return sample
 
@@ -159,11 +231,13 @@ def clean_data(raw_data):
         num_proc=8,
         desc="filtering bad samples"
     )
-
+    cur_path = os.path.join(os.getcwd(),"id.txt")
+    with open(cur_path, "w+") as f:
+        f.write(str(ids))
     print(f"清洗完成！")
     print(f"清洗前：train={len(raw_data['train'])}, test={len(raw_data['test'])}")
     print(f"清洗后：train={len(data_filtered['train'])}, test={len(data_filtered['test'])}")
-    generate_quality_report(data_filtered['train'])
+    # generate_quality_report(data_filtered['train'])
     return data_filtered
 
 # ------------------------------------------------------------------------------

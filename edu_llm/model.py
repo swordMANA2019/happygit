@@ -2,6 +2,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 from transformers.modeling_outputs import CausalLMOutputWithPast
+from transformers import AutoModelForCausalLM,PreTrainedModel
 
 # hyper parameters
 HIDDEN_SIZE = 512
@@ -128,7 +129,6 @@ class DecoderOnlyModel(nn.Module):
         h = self.emb(input_ids)
         h = self.pos(h)
         h = self.dropout(h)
-
         mask = self.causal_mask[:L, :L].to(h.device)
         for layer in self.layers:
             h = layer(h, mask)
@@ -146,3 +146,72 @@ class DecoderOnlyModel(nn.Module):
             )
 
         return CausalLMOutputWithPast(loss=loss, logits=logits, past_key_values=None)
+
+    def generate(
+            self,
+            input_ids,
+            max_new_tokens=800,
+            temperature=0.3,
+            top_p=0.9,
+            repetition_penalty=1.05,
+            do_sample=True,
+            eos_token_id=None,
+            pad_token_id=None
+    ):
+        # ========== 动态控制回答长度 ==========
+        seq_len = input_ids.shape[1]
+        if seq_len <= 15:
+            max_new_tokens = 100
+        elif seq_len <= 30:
+            max_new_tokens = 300
+        self.eval()
+        generated = input_ids.clone()
+        for _ in range(max_new_tokens):
+            with torch.no_grad():
+                outputs = self(generated)
+
+            logits = outputs.logits[:, -1, :]  # 取最后一个token
+
+            # --------------------------
+            # 1. 重复惩罚（关键！）
+            # --------------------------
+            if repetition_penalty != 1.0:
+                for i in range(generated.shape[1]):
+                    tok = generated[:, i].unsqueeze(-1)
+                    logits.scatter_(dim=-1,
+                                    index=tok,
+                                    src=logits.gather(-1, tok) / repetition_penalty)
+            # --------------------------
+            # 2. 温度采样
+            # --------------------------
+            logits = logits / temperature
+            # --------------------------
+            # 3. Top-p 核采样
+            # --------------------------
+            if do_sample and top_p > 0:
+                sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+                cumulative_probs = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
+                sorted_indices_to_remove = cumulative_probs > top_p
+                sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+                sorted_indices_to_remove[..., 0] = 0
+                for i in range(sorted_indices.shape[0]):
+                    idx = sorted_indices[i][sorted_indices_to_remove[i]]
+                    logits[i, idx] = -float("inf")
+
+            # --------------------------
+            # 采样 / 贪心
+            # --------------------------
+            if do_sample:
+                probs = torch.softmax(logits, dim=-1)
+                next_token = torch.multinomial(probs, num_samples=1)
+            else:
+                next_token = torch.argmax(logits, dim=-1, keepdim=True)
+
+            # 追加 token
+            generated = torch.cat([generated, next_token], dim=-1)
+
+            # 遇到结束符停止
+            if next_token.item() == eos_token_id:
+                break
+
+        return generated
