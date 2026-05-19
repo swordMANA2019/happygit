@@ -304,3 +304,67 @@ For Chinese continuation tasks with non-empty prompts:
 
 Many models work without explicit BOS.  
 But EOS is still strongly recommended (boundary + stop).
+
+---
+
+## 预训练问题排查总结（中文）
+
+### 现象
+
+- 在训练进度到约 55% 时，日志中的 `loss` 仍在 `46.7` 左右，感觉像“几乎不下降”。
+- 同时生成质量一般，存在重复或边界不清的问题。
+
+### 核心结论
+
+模型并没有明显“坏掉”，数据也不是单一灾难性错误；主要是**日志读法 + 训练配置细节**共同导致“看起来 loss 卡住”。
+
+### 1) 为什么会看到 `46.7`：这是被梯度累积放大的显示值
+
+当前配置里 `gradient_accumulation_steps=6`。训练日志中的 `loss` 在该版本 Trainer 下会受到累积方式影响，数值常接近“真实 token loss 的 6 倍”。
+
+- 经验换算：`46.7 / 6 ~= 7.8`
+- 而日志里的 `eval_loss` 约为 `7.786`，与换算后的训练损失一致
+
+因此 `46.7` 不能直接当作“真实每 token 交叉熵”去解读。判断收敛应优先看 `eval_loss`。
+
+### 2) 为什么中后期像平台期：学习率进入尾段
+
+日志显示继续训练来自较晚检查点，学习率一路衰减到极小值（接近 `1e-8` 量级）。此时参数更新幅度很小，损失下降自然变慢，表现为平台期。
+
+这属于调度尾段现象，不是模型结构崩溃。
+
+### 3) 代码中值得修复的两个关键点
+
+#### A. `model.py` 中 dropout 被配置覆盖为 0
+
+`DecoderOnlyModel` 初始化里：
+
+- 传入了 `dropout=0.1`
+- 但随后用 `config.attention_dropout` 覆盖
+- `Qwen2Config` 默认该值常为 `0.0`
+
+结果是实际 dropout 可能被静默置零，削弱正则化。
+
+#### B. `pretrain.py` 中将 `pad_token` 设为 `eos_token`
+
+`DataCollatorForLanguageModeling(mlm=False)` 会把 pad 位标签置为 `-100`。若 `pad_token_id == eos_token_id`，会把 EOS 监督信号一并屏蔽，影响模型学习“结束”行为。
+
+建议使用独立 `pad_token`，避免与 `eos_token` 共用 ID。
+
+### 4) 数据侧还有一个常见质量点：样本边界
+
+若打包/切块时未在文档边界显式插入 EOS，模型会学习到跨文档的伪连续性，影响困惑度和生成连贯性。应在样本边界插入 EOS 再进行 chunk/pack。
+
+### 是否“模型或数据有问题”——最终判断
+
+- **不是单点致命错误**，训练过程总体稳定。
+- **确实有可优化问题**：损失解读方式、学习率尾段、dropout 覆盖、EOS 与 pad 冲突、边界处理。
+- 当前 checkpoint 更像“中间态”，可继续优化后再训练，不建议直接当最终模型。
+
+### 建议的下一步（按优先级）
+
+1. 以 `eval_loss`（及 PPL）为主指标，不再直接用 `46.x` 判断是否收敛。  
+2. 继续训练时采用“重启优化器/调度器”的方式（如 weights-only resume + 合理初始 LR）。  
+3. 修复 dropout 覆盖逻辑，确保训练确实使用期望的 dropout。  
+4. 使用独立 `pad_token`，避免屏蔽 EOS 监督。  
+5. 确保文档边界插入 EOS 后再 tokenization/packing。  

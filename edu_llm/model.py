@@ -83,10 +83,15 @@ class DecoderOnlyModel(nn.Module):
             _d_model = config.hidden_size
             _nhead = config.num_attention_heads
             _nlayers = config.num_hidden_layers
-            _ntermediate_size = getattr(config, "intermediate_size", None)
+            _intermediate_size = getattr(config, "intermediate_size", None)
             _max_seq_len = config.max_position_embeddings
-            # Align decoder dropout with HF config when provided.
-            _dropout = getattr(config, "attention_dropout", dropout)
+            # Keep the caller-supplied dropout; only fall back to config's
+            # attention_dropout when the caller left dropout at its default (0.1).
+            # Qwen2Config.attention_dropout defaults to 0.0, so blindly using it
+            # would silently zero out all regularisation.
+            config_attn_dropout = getattr(config, "attention_dropout", None)
+            if config_attn_dropout is not None and config_attn_dropout > 0.0:
+                _dropout = config_attn_dropout
             self.bos_token_id = getattr(config, "bos_token_id", None)
             self.eos_token_id = getattr(config, "eos_token_id", None)
         else:
@@ -94,8 +99,8 @@ class DecoderOnlyModel(nn.Module):
             self.eos_token_id = None
         if _vocab_size is None:
             raise ValueError("vocab_size must be provided when config is None")
-        if intermediate_size is None:
-            _intermediate_size = d_model * 4
+        if _intermediate_size is None:
+            _intermediate_size = _d_model * 4
         self.vocab_size = _vocab_size
         self.config = config if config is not None else None
         self.emb = nn.Embedding(_vocab_size, _d_model)
@@ -104,7 +109,7 @@ class DecoderOnlyModel(nn.Module):
         self.layers = nn.ModuleList(
             [
                 DecoderLayer(_d_model, _nhead, intermediate_size=_intermediate_size, dropout=dropout)
-                for _ in range(num_layers)
+                for _ in range(_nlayers)
             ]
         )
         self.fc = nn.Linear(_d_model, _vocab_size)

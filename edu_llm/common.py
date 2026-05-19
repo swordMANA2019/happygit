@@ -11,7 +11,6 @@ import numpy as np
 from model import DecoderOnlyModel
 
 MODEL_ID = os.environ.get("MODEL_ID", "Qwen/Qwen2-0.5B")
-ids = ""
 
 def get_data_paths(data_dir: str):
     """统一管理所有路径"""
@@ -63,7 +62,8 @@ class DataCleaner:
         )
 
         # 质量过滤
-        self.noise_pattern = re.compile(r"[^\w\s\u4e00-\u9fff.,!?;:'\"，。！？、；：‘’“”（）]")
+        # 显式列出合法字符，不用 \w 避免把下划线视为合法字符
+        self.noise_pattern = re.compile(r"[^a-zA-Z0-9\s\u4e00-\u9fff.,!?;:'\"，。！？、；：‘’“”（）]")
         self.punctuation = set(".,!?;:'\"，。！？、；：‘’“”（）()")
         self.url_pattern = re.compile(r"http[s]?://\S+|www\.\S+")
 
@@ -102,8 +102,8 @@ class DataCleaner:
         return counter.most_common(1)[0][1] / len(ngrams)
 
     def _is_high_quality(self, text: str) -> bool:
-        # 1. 过滤：太短的句子 → 没用
-        if len(text) < 20:
+        # Align minimum length with the downstream is_valid_text threshold (40).
+        if len(text) < MIN_TEXT_LENGTH:
             return False
 
         # 2. 过滤：重复率太高 → 复读机垃圾
@@ -151,15 +151,22 @@ def has_ngram_repeat(text, n=10, threshold=3):
 # 核心：给 datasets 用的清洗函数（map 专用）
 # ==============================================
 
+# Module-level singleton used by clean_sample.
+# datasets.map with num_proc>1 forks the process, so each worker gets its own
+# copy of this object.  That is intentional for basic cleaning; cross-process
+# deduplication is handled separately in a single-process pass (see clean_data).
+_cleaner = DataCleaner()
+
 def clean_sample(sample):
-    cleaner = DataCleaner()
+    # Basic cleaning only (URL removal, bracket cleanup, whitespace, quality
+    # heuristics).  Deduplication is NOT done here because parallel workers
+    # cannot share hash-set state across OS process boundaries.
     raw_text = sample["text"]
-    text = cleaner.clean(raw_text)
-    global ids
-    if text is None:
-        ids += sample["id"]
-        ids += "\n"
-    sample["text"] = text
+    cleaned = _cleaner._basic_clean(raw_text)
+    if cleaned and _cleaner._is_high_quality(cleaned):
+        sample["text"] = cleaned
+    else:
+        sample["text"] = None
     return sample
 
 def filter_valid(sample):
@@ -171,6 +178,26 @@ def filter_valid(sample):
     if has_ngram_repeat(text, threshold=NGRAM_REPEAT_LIMIT):
         return False
     return True
+
+def _dedup_dataset(dataset):
+    """Single-process exact-dedup pass using MD5 of normalised text.
+
+    Must run in a single process (num_proc=1) so the seen-hash set is shared
+    across all samples.  Parallelising this would silently skip deduplication.
+    """
+    seen: set = set()
+
+    def _keep(sample):
+        text = sample["text"]
+        if not text:
+            return False
+        h = hashlib.md5(text.strip().lower().encode("utf-8")).hexdigest()
+        if h in seen:
+            return False
+        seen.add(h)
+        return True
+
+    return dataset.filter(_keep, num_proc=1, desc="deduplicating")
 
 # ==============================================
 # PPL样本loss
@@ -218,27 +245,36 @@ def generate_quality_report(dataset, name="dataset"):
 # ==============================================
 def clean_data(raw_data):
     print("开始清洗 text 字段...")
-    # 1. 清洗文本（map）
+    n_train_before = len(raw_data["train"])
+    n_test_before  = len(raw_data["test"])
+
+    # Step 1: basic cleaning in parallel (URL removal, bracket/whitespace
+    # normalisation, per-sample quality heuristics).
     data_cleaned = raw_data.map(
         clean_sample,
         num_proc=8,
         desc="cleaning text"
     )
 
-    # 2. 过滤低质量样本
+    # Step 2: filter low-quality samples (length, valid-char ratio, n-gram repeat).
     data_filtered = data_cleaned.filter(
         filter_valid,
         num_proc=8,
         desc="filtering bad samples"
     )
-    cur_path = os.path.join(os.getcwd(),"id.txt")
-    with open(cur_path, "w+") as f:
-        f.write(str(ids))
-    print(f"清洗完成！")
-    print(f"清洗前：train={len(raw_data['train'])}, test={len(raw_data['test'])}")
-    print(f"清洗后：train={len(data_filtered['train'])}, test={len(data_filtered['test'])}")
-    # generate_quality_report(data_filtered['train'])
-    return data_filtered
+
+    # Step 3: exact deduplication — must be single-process so the hash set is
+    # shared across all samples.  Running with num_proc>1 would partition the
+    # dataset across workers and miss cross-partition duplicates entirely.
+    data_deduped = datasets.DatasetDict({
+        split: _dedup_dataset(data_filtered[split])
+        for split in data_filtered
+    })
+
+    print("清洗完成！")
+    print(f"清洗前：train={n_train_before}, test={n_test_before}")
+    print(f"清洗后：train={len(data_deduped['train'])}, test={len(data_deduped['test'])}")
+    return data_deduped
 
 # ------------------------------------------------------------------------------
 # 抽样测试ppl

@@ -164,7 +164,11 @@ def _load_or_build_tokenized(data_json: str, cache_root: str, raw_data, tokenize
             logger.warning(f"缓存加载失败，重新处理数据：{e}")
 
     def tokenize(element):
-        outputs = tokenizer(element["text"], truncation=True, max_length=context_length, return_overflowing_tokens=True, return_length=True)
+        # Append EOS to each article so the model learns document boundaries.
+        # Without this, chunks from different articles are indistinguishable and
+        # the model learns false cross-document continuity.
+        texts_with_eos = [t + tokenizer.eos_token for t in element["text"]]
+        outputs = tokenizer(texts_with_eos, truncation=True, max_length=context_length, return_overflowing_tokens=True, return_length=True)
         return {"input_ids": [ids for l, ids in zip(outputs["length"], outputs["input_ids"]) if l == context_length]}
 
     logger.info("正在处理数据...")
@@ -220,17 +224,24 @@ def main():
             logger.error("❌ Tokenizer加载失败，程序退出")
             return
 
-        # 处理数据集
+        # Add a dedicated pad token so that DataCollatorForLanguageModeling can
+        # mask pad positions with label=-100 without accidentally masking EOS
+        # tokens (which carry the "stop generating" supervision signal).
+        if tokenizer.pad_token is None or tokenizer.pad_token_id == tokenizer.eos_token_id:
+            tokenizer.add_special_tokens({"pad_token": "<|pad|>"})
+            logger.info(f"新增独立 pad_token: id={tokenizer.pad_token_id}")
+
+        # 处理数据集（tokenizer已固定，在tokenize之前确定pad_token）
         tokenized_datasets = _load_or_build_tokenized(
             paths["data_json"], paths["cache_root"], raw_data, tokenizer, 512)
-        tokenizer.pad_token = tokenizer.eos_token
         data_collator = transformers.DataCollatorForLanguageModeling(tokenizer, mlm=False)
 
-        # 初始化模型
+        # 初始化模型（vocab_size已包含新增的pad token）
         config = Qwen2Config(
             vocab_size=len(tokenizer), hidden_size=512, intermediate_size=2048,
             num_attention_heads=8, num_hidden_layers=12, max_position_embeddings=1024,
-            bos_token_id=tokenizer.bos_token_id, eos_token_id=tokenizer.eos_token_id
+            bos_token_id=tokenizer.bos_token_id, eos_token_id=tokenizer.eos_token_id,
+            pad_token_id=tokenizer.pad_token_id,
         )
         model = DecoderOnlyModel(config=config, dropout=0.1)
         logger.info(f"模型参数量：{sum(p.numel() for p in model.parameters())/1e6:.1f}")
