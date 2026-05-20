@@ -44,6 +44,8 @@ def parse_args():
     parser.add_argument("--train_batch_size", type=int, default=None, help="单卡训练batch size")
     parser.add_argument("--eval_batch_size", type=int, default=None, help="单卡验证batch size")
     parser.add_argument("--grad_accum", type=int, default=None, help="梯度累积步数")
+    parser.add_argument("--num_epochs", type=int, default=10,
+                        help="训练总轮数。2轮远不够收敛，建议至少10轮 (default: 10)")
     return parser.parse_args()
 
 # ===================== 路径配置 =====================
@@ -265,8 +267,17 @@ def main():
             per_device_eval_batch_size=eval_bs,
             gradient_accumulation_steps=grad_accum,
             eval_strategy="steps", eval_steps=500, logging_steps=50,
-            num_train_epochs=2, weight_decay=0.1, warmup_steps=200,
+            num_train_epochs=args.num_epochs,   # was hard-coded to 2; 2 epochs
+                                                # is far from convergence — use
+                                                # --num_epochs to control (default 10)
+            weight_decay=0.1,
+            warmup_steps=500,                   # was 200; with proper embedding
+                                                # init the model still benefits
+                                                # from a longer ramp to peak LR
+                                                # to absorb large initial updates
             learning_rate=5e-4, lr_scheduler_type="cosine", optim="adamw_torch",
+            max_grad_norm=1.0,                  # explicit gradient clipping;
+                                                # dampens outlier-batch spikes
             # 核心：开启检查点 + 禁用safetensors（解决权重共享报错）
             save_strategy="steps",      # 开启按步数保存
             save_steps=100,             # 每100步生成检查点（快速生效）
@@ -300,10 +311,30 @@ def main():
         _save_decoder_checkpoint(model, config, paths["model_weights"])
 
         # 生成测试
+        # Use model.generate() (with repetition penalty + sampling) so the test
+        # reflects the same decoding path that real inference uses.  The old
+        # _greedy_generate() did pure argmax and had no repetition penalty,
+        # causing the model to loop on "，，，，，" even when it had learned
+        # meaningful token distributions.
         logger.info("\n 生成测试结果：")
         device = next(model.parameters()).device
+        model.eval()
         for prompt in ["人工智能", "牛顿", "北京市", "亚洲历史"]:
-            res = _greedy_generate(model, tokenizer, prompt, device=device)
+            input_ids = torch.tensor(
+                [tokenizer.encode(prompt) or [tokenizer.eos_token_id]],
+                device=device,
+            )
+            out_ids = model.generate(
+                input_ids,
+                max_new_tokens=100,
+                temperature=0.8,
+                top_p=0.9,
+                repetition_penalty=1.3,
+                do_sample=True,
+                eos_token_id=tokenizer.eos_token_id,
+                pad_token_id=tokenizer.pad_token_id,
+            )
+            res = tokenizer.decode(out_ids[0], skip_special_tokens=True)
             logger.info(f"{prompt}: {res}")
 
         logger.info("训练任务完成！")

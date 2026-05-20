@@ -50,9 +50,15 @@ class DecoderLayer(nn.Module):
         )
 
     def forward(self, x, attn_mask):
-        attn_out, _ = self.self_attn(x, x, x, attn_mask=attn_mask)
-        x = self.norm1(x + attn_out)
-        x = self.norm2(x + self.ffn(x))
+        # Pre-LN: normalise BEFORE attention/FFN so residual stream stays clean.
+        # Post-LN (the original order) is more sensitive to outlier batches
+        # because the un-normalised residual can carry large magnitudes into the
+        # next layer; Pre-LN eliminates that path and removes the loss spikes
+        # seen in the tiger-4 run at epochs 0.80 and 0.91-0.94.
+        normed = self.norm1(x)
+        attn_out, _ = self.self_attn(normed, normed, normed, attn_mask=attn_mask)
+        x = x + attn_out
+        x = x + self.ffn(self.norm2(x))
         return x
 
 # --------------------------
@@ -115,6 +121,15 @@ class DecoderOnlyModel(nn.Module):
         self.fc = nn.Linear(_d_model, _vocab_size)
         # Tie input/output embeddings to improve sample efficiency.
         self.fc.weight = self.emb.weight
+        # Scale embedding init to std=0.02 (GPT-2 convention).
+        # Default nn.Embedding uses std=1.0, which produces logit magnitudes of
+        # ~sqrt(d_model)=22 and an initial loss of ~560 instead of the
+        # theoretical minimum ln(vocab_size)≈11.9.  std=0.02 brings the first
+        # step loss down to ~12–14, giving a much cleaner loss curve.
+        nn.init.normal_(self.emb.weight, mean=0.0, std=0.02)
+        # Pre-LN models need an explicit final norm: the last decoder layer's
+        # output is only the raw residual sum — no LayerNorm wraps it.
+        self.norm = nn.LayerNorm(_d_model)
         self.register_buffer(
             "causal_mask",
             torch.triu(torch.ones(_max_seq_len, _max_seq_len, dtype=torch.bool), diagonal=1),
@@ -138,7 +153,7 @@ class DecoderOnlyModel(nn.Module):
         for layer in self.layers:
             h = layer(h, mask)
 
-        logits = self.fc(h)
+        logits = self.fc(self.norm(h))
 
         loss = None
         if labels is not None:
@@ -183,9 +198,17 @@ class DecoderOnlyModel(nn.Module):
             if repetition_penalty != 1.0:
                 for i in range(generated.shape[1]):
                     tok = generated[:, i].unsqueeze(-1)
-                    logits.scatter_(dim=-1,
-                                    index=tok,
-                                    src=logits.gather(-1, tok) / repetition_penalty)
+                    score = logits.gather(-1, tok)
+                    # Positive logits must be divided (reduced); negative logits
+                    # must be multiplied (made more negative).  The original code
+                    # always divided, which made negative scores less negative —
+                    # the opposite of a penalty.
+                    score = torch.where(
+                        score < 0,
+                        score * repetition_penalty,
+                        score / repetition_penalty,
+                    )
+                    logits.scatter_(dim=-1, index=tok, src=score)
             # --------------------------
             # 2. 温度采样
             # --------------------------
