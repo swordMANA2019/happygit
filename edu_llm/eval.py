@@ -21,13 +21,28 @@ model = Qwen2ForCausalLM.from_pretrained(
 )
 '''
 def load_model(path, tokenizer):
-    # 加载模型
-    state_dict = torch.load(path["model_weights"]+"/pytorch_model.bin")
+    # Ensure <|pad|> token exists in the tokenizer before building the config.
+    # Without this the pad_token_id is None and the model generates pad tokens
+    # as content (shows up as empty brackets in output).
+    if tokenizer.pad_token_id is None:
+        tokenizer.add_special_tokens({"pad_token": "<|pad|>"})
+
+    state_dict = torch.load(
+        path["model_weights"] + "/pytorch_model.bin",
+        map_location="cpu",
+        weights_only=False,
+    )
     config = Qwen2Config(
-                vocab_size=len(tokenizer)+1, hidden_size=512, intermediate_size=2048,
-                num_attention_heads=8, num_hidden_layers=12, max_position_embeddings=1024,
-                bos_token_id=tokenizer.bos_token_id, eos_token_id=tokenizer.eos_token_id
-            )
+        vocab_size=len(tokenizer),          # must reflect any newly added tokens
+        hidden_size=512,
+        intermediate_size=2048,
+        num_attention_heads=8,
+        num_hidden_layers=12,
+        max_position_embeddings=1024,
+        bos_token_id=tokenizer.bos_token_id,
+        eos_token_id=tokenizer.eos_token_id,
+        pad_token_id=tokenizer.pad_token_id,
+    )
     model = DecoderOnlyModel(config=config, dropout=0.1)
     model.load_state_dict(state_dict)
     return model
@@ -47,12 +62,13 @@ def ask_edu_model(model:DecoderOnlyModel, question:str, tokenizer):
     with torch.no_grad():
         outputs = model.generate(
             input_ids,
-            max_new_tokens=300,  # 科教回答长度
-            temperature=0.3,  # 越低越严谨（科教必须低）
+            max_new_tokens=300,
+            temperature=0.8,          # was 0.3; higher temperature reduces degenerate loops
             top_p=0.9,
-            repetition_penalty=1.05,
+            repetition_penalty=1.3,   # was 1.05; stronger penalty suppresses () repetition
             do_sample=True,
-            eos_token_id=tokenizer.eos_token_id
+            eos_token_id=tokenizer.eos_token_id,
+            pad_token_id=tokenizer.pad_token_id,  # prevents pad tokens appearing as content
         )
 
     response = tokenizer.decode(outputs[0][len(input_ids[0]):], skip_special_tokens=True)
