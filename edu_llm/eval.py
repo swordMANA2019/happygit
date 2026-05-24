@@ -24,7 +24,7 @@ def load_model(path, tokenizer):
     # 加载模型
     state_dict = torch.load(path["model_weights"]+"/pytorch_model.bin")
     config = Qwen2Config(
-                vocab_size=len(tokenizer), hidden_size=512, intermediate_size=2048,
+                vocab_size=len(tokenizer)+1, hidden_size=512, intermediate_size=2048,
                 num_attention_heads=8, num_hidden_layers=12, max_position_embeddings=1024,
                 bos_token_id=tokenizer.bos_token_id, eos_token_id=tokenizer.eos_token_id
             )
