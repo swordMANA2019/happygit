@@ -42,7 +42,8 @@ import sys
 os.environ["HF_ENDPOINT"]      = "https://hf-mirror.com"
 os.environ["CURL_CA_BUNDLE"]   = ""
 os.environ["REQUESTS_CA_BUNDLE"] = ""
-
+os.environ["HF_HUB_CACHE"] = "/mnt/build/llm_data/huggingface/hub"
+os.environ["HF_DATASETS_CACHE"] = "/mnt/build/llm_data/huggingface/datasets"
 import ssl
 ssl._create_default_https_context = ssl._create_unverified_context
 
@@ -72,7 +73,7 @@ MAX_FILE_BYTES = 20 * 1024 * 1024   # 20 MB cap per topic file
 STATE_FILE     = "science_state.json"
 MIN_CHARS      = 200
 OUTPUT_DIR     = "."
-
+CACHE_DIR = "/mnt/build/llm_data"
 # ── Data sources ────────────────────────────────────────────────────────────
 # Sourced from datasets confirmed accessible via hf-mirror.com.
 # "configs" : sub-config names to try (first success wins); None = no sub-config.
@@ -87,15 +88,15 @@ SOURCES = [
         "text_fields": ["text"],
         "note":        "Chinese Wikipedia — ~1.3 M encyclopaedia articles",
     },
-    {
-        # Common Crawl filtered by Google for clean web text; zh config is ~33 GB
-        "id":          "c4_zh",
-        "dataset":     "allenai/c4",
-        "configs":     ["zh"],
-        "split":       "train",
-        "text_fields": ["text"],
-        "note":        "C4 Chinese web corpus (Common Crawl, quality-filtered)",
-    },
+    # {
+    #     # Common Crawl filtered by Google for clean web text; zh config is ~33 GB
+    #     "id":          "c4_zh",
+    #     "dataset":     "allenai/c4",
+    #     "configs":     ["zh"],
+    #     "split":       "train",
+    #     "text_fields": ["text"],
+    #     "note":        "C4 Chinese web corpus (Common Crawl, quality-filtered)",
+    # },
     {
         # CC-100: deduplicated Common Crawl built for language-model pre-training
         "id":          "cc100_zh",
@@ -340,13 +341,20 @@ def _load_hf_dataset(src: dict):
     except ImportError:
         print("ERROR: 'datasets' not installed.  Run: pip install datasets huggingface-hub")
         return None, None
-
+    DOWNLOAD_PARQUET_NUM = 35
     for cfg in src["configs"]:
         try:
             kwargs = dict(split=src["split"], trust_remote_code=True)
             if cfg is not None:
                 kwargs["name"] = cfg
-            ds = hf_datasets.load_dataset(src["dataset"], **kwargs)
+
+            if src["id"] == "chinese_edu_web":
+                file_list = [f"IndustryCorpus/{i:05d}.parquet" for i in range(DOWNLOAD_PARQUET_NUM)]
+                kwargs["data_files"] = {src["split"]: file_list}
+                # 关闭数据集大小校验，避免元数据和实际文件数量不一致报错
+                kwargs["verification_mode"] = "no_checks"
+
+            ds = hf_datasets.load_dataset(src["dataset"],cache_dir=CACHE_DIR,**kwargs)
             label = f"{src['dataset']} ({cfg})" if cfg else src["dataset"]
             print(f"  Loaded {label}  ({len(ds):,} rows)")
             return ds, cfg
@@ -588,13 +596,16 @@ def parse_args():
     p.add_argument("--verify",       action="store_true", help="Verify SHA-256 checksums.")
     p.add_argument("--test-sources", action="store_true",
                    help="Check each source: reachable? fields? sample text? classification?")
+    p.add_argument("--cache-dir", default="/mnt/build/llm_data",
+                   help="Directory for scienceN.json files (default: .).")
     return p.parse_args()
 
 
 def main():
-    global OUTPUT_DIR
+    global OUTPUT_DIR,CACHE_DIR
     args       = parse_args()
     OUTPUT_DIR = os.path.abspath(args.output_dir)
+    CACHE_DIR = os.path.abspath(args.cache_dir)
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     print(f"Output directory: {OUTPUT_DIR}")
 

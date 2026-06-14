@@ -243,7 +243,7 @@ def main():
             vocab_size=len(tokenizer), hidden_size=512, intermediate_size=2048,
             num_attention_heads=8, num_hidden_layers=12, max_position_embeddings=1024,
             bos_token_id=tokenizer.bos_token_id, eos_token_id=tokenizer.eos_token_id,
-            pad_token_id=tokenizer.pad_token_id,
+            pad_token_id=tokenizer.pad_token_id
         )
         model = DecoderOnlyModel(config=config, dropout=0.1)
         logger.info(f"模型参数量：{sum(p.numel() for p in model.parameters())/1e6:.1f}")

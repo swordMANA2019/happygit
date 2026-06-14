@@ -18,13 +18,14 @@ Usage examples:
 """
 
 import argparse
-import hashlib
+import datasets
 import json
 import os
 import random
 import re
 import sys
 from collections import Counter
+from common import get_data_paths, clean_data
 
 # Ensure the console can handle Unicode (e.g. Chinese chars) on Windows.
 if hasattr(sys.stdout, "reconfigure"):
@@ -416,6 +417,10 @@ def parse_args():
              "Omit to use built-in synthetic samples.",
     )
     parser.add_argument(
+        "--data-dir", default=None,
+        help="Path to raw JSON data directory",
+    )
+    parser.add_argument(
         "--sample-size", type=int, default=0,
         help="Number of records to sample from the dataset (0 = all). Default: 0.",
     )
@@ -444,10 +449,18 @@ def parse_args():
 # ===========================================================================
 def main():
     args = parse_args()
-
     # ── Load data ──────────────────────────────────────────────────────────
     if args.data_file:
         texts = load_from_json(args.data_file, args.sample_size, args.seed)
+    elif args.data_dir:
+        paths = get_data_paths(args.data_dir)
+        raw_datasets = datasets.load_dataset("json", data_files=paths["data_json"])
+        keep_tags = ["物理", "化学", "生物", "数学"]
+        raw_datasets = raw_datasets.filter(lambda x: "tags" in x
+    and x["tags"] in keep_tags)
+        raw_data = raw_datasets["train"].train_test_split(test_size=0.1, seed=2333)
+        clean_data(raw_data)
+        return
     else:
         texts = load_synthetic()
 
