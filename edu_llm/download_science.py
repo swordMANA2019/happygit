@@ -39,22 +39,47 @@ import os
 import sys
 
 # ── Must be set BEFORE huggingface_hub / datasets are imported ────────────
-os.environ["HF_ENDPOINT"]      = "https://hf-mirror.com"
-os.environ["CURL_CA_BUNDLE"]   = ""
-os.environ["REQUESTS_CA_BUNDLE"] = ""
-os.environ["HF_HUB_CACHE"] = "/mnt/build/llm_data/huggingface/hub"
-os.environ["HF_DATASETS_CACHE"] = "/mnt/build/llm_data/huggingface/datasets"
+os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
+os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
+
+def _default_cache_dir() -> str:
+    return os.path.join(os.path.expanduser("~"), "Documents", "data", "hf_cache")
+
+_cache_base = _default_cache_dir()
+os.environ.setdefault("HF_HUB_CACHE", os.path.join(_cache_base, "hub"))
+os.environ.setdefault("HF_DATASETS_CACHE", os.path.join(_cache_base, "datasets"))
+
 import ssl
-ssl._create_default_https_context = ssl._create_unverified_context
 
 try:
-    import requests, urllib3
+    import certifi
+    _ca_bundle = certifi.where()
+    os.environ["SSL_CERT_FILE"] = _ca_bundle
+    os.environ["REQUESTS_CA_BUNDLE"] = _ca_bundle
+    os.environ["CURL_CA_BUNDLE"] = _ca_bundle
+except ImportError:
+    pass
+
+# Corporate proxies (e.g. Zscaler) often MITM HTTPS; hf-mirror uses httpx.
+ssl._create_default_https_context = ssl._create_unverified_context
+try:
+    import httpx
+    import urllib3
     urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-    _orig_send = requests.Session.send
-    def _send_no_verify(self, req, **kw):
-        kw["verify"] = False
-        return _orig_send(self, req, **kw)
-    requests.Session.send = _send_no_verify
+
+    _httpx_client_init = httpx.Client.__init__
+    _httpx_async_init = httpx.AsyncClient.__init__
+
+    def _client_init_no_verify(self, *args, **kwargs):
+        kwargs["verify"] = False
+        _httpx_client_init(self, *args, **kwargs)
+
+    def _async_init_no_verify(self, *args, **kwargs):
+        kwargs["verify"] = False
+        _httpx_async_init(self, *args, **kwargs)
+
+    httpx.Client.__init__ = _client_init_no_verify
+    httpx.AsyncClient.__init__ = _async_init_no_verify
 except ImportError:
     pass
 
@@ -73,7 +98,7 @@ MAX_FILE_BYTES = 20 * 1024 * 1024   # 20 MB cap per topic file
 STATE_FILE     = "science_state.json"
 MIN_CHARS      = 200
 OUTPUT_DIR     = "."
-CACHE_DIR = "/mnt/build/llm_data"
+CACHE_DIR = _default_cache_dir()
 # ── Data sources ────────────────────────────────────────────────────────────
 # Sourced from datasets confirmed accessible via hf-mirror.com.
 # "configs" : sub-config names to try (first success wins); None = no sub-config.
@@ -97,15 +122,16 @@ SOURCES = [
     #     "text_fields": ["text"],
     #     "note":        "C4 Chinese web corpus (Common Crawl, quality-filtered)",
     # },
-    {
-        # CC-100: deduplicated Common Crawl built for language-model pre-training
-        "id":          "cc100_zh",
-        "dataset":     "cc100",
-        "configs":     ["zh-Hans-CN"],
-        "split":       "train",
-        "text_fields": ["text"],
-        "note":        "CC-100 Simplified Chinese web crawl",
-    },
+    # {
+    #     # CC-100: requires dataset loading script — not supported by datasets>=5.0
+    #     "id":          "cc100_zh",
+    #     "dataset":     "parquet",
+    #     "configs":     ["zh-Hans-CN"],
+    #     "split":       "train",
+    #     "text_fields": ["text"],
+    #     "note":        "CC-100 Simplified Chinese web crawl",
+    #     "parquet_glob": "hf://datasets/cc100/{config}/train-*.parquet",
+    # },
     {
         # BAAI high-quality Chinese corpus (news, books, web, encyclopaedia)
         "id":          "cci3_hq",
@@ -127,120 +153,223 @@ SOURCES = [
 ]
 
 # ── Topic definitions ──────────────────────────────────────────────────────
-# Each topic maps to one output file.  An article is classified into the FIRST
-# topic whose keywords appear in the opening 600 characters.
-# Order matters: more specific topics should come before broader ones.
+# classify() scores every topic on the opening SNIPPET_LEN characters.
+# Each keyword match adds weight = len(keyword); anchor hits add ANCHOR_BONUS.
+# A topic wins only when it clears MIN_TOPIC_SCORE and beats the runner-up by
+# MIN_SCORE_MARGIN (accuracy clarification — no hard-coded category exclusions).
+SNIPPET_LEN = 600
+MIN_TOPIC_SCORE = 4
+MIN_SCORE_MARGIN = 2
+ANCHOR_BONUS = 4
+STRONG_SCORE = 10          # high score alone is enough without an anchor match
+
+# Traditional → simplified (common in zh Wikipedia) for stable matching.
+_T2S = str.maketrans({
+    "學": "学", "與": "与", "國": "国", "劑": "剂", "機": "机", "體": "体",
+    "電": "电", "質": "质", "變": "变", "濟": "济", "經": "经", "歷": "历",
+    "時": "时", "間": "间", "這": "这", "個": "个", "們": "们", "來": "来",
+    "說": "说", "會": "会", "對": "对", "無": "无", "環": "环", "應": "应",
+    "現": "现", "實": "实", "驗": "验", "測": "测", "溫": "温", "壓": "压",
+    "氣": "气", "陽": "阳", "陰": "阴", "離": "离", "還": "还", "總": "总",
+    "統": "统", "計": "计", "數": "数", "結": "结", "構": "构", "組": "组",
+    "織": "织", "繫": "系", "統": "统", "廣": "广", "義": "义", "藝": "艺",
+    "術": "术", "區": "区", "網": "网", "際": "际", "訊": "讯", "視": "视",
+    "聽": "听", "醫": "医", "藥": "药", "診": "诊", "療": "疗", "傳": "传",
+    "統": "统", "動": "动", "態": "态", "場": "场", "類": "类", "種": "种",
+    "為": "为", "從": "从", "過": "过", "進": "进", "開": "开", "發": "发",
+    "關": "关", "係": "系", "聯": "联", "繫": "系", "標": "标", "準": "准",
+    "圖": "图", "書": "书", "館": "馆", "識": "识", "認": "认", "證": "证",
+    "據": "据", "讀": "读", "寫": "写", "編": "编", "劇": "剧", "觀": "观",
+    "眾": "众", "裡": "里", "內": "内", "應": "应", "該": "该", "規": "规",
+    "模": "模", "壓": "压", "歡": "欢", "迎": "迎", "歐": "欧", "無": "无",
+    "線": "线", "組": "组", "成": "成", "絡": "络", "聯": "联", "繫": "系",
+    "舉": "举", "行": "行", "變": "变", "成": "成", "認": "认", "識": "识",
+    "讓": "让", "們": "们", "經": "经", "常": "常", "進": "进", "行": "行",
+    "測": "测", "量": "量", "溫": "温", "度": "度", "環": "环", "與": "与",
+})
+
+def _normalize_zh(text: str) -> str:
+    return text.translate(_T2S)
+
+
 TOPICS = [
-    {
-        "file":  "physics.json",
-        "label": "Physics (物理)",
-        "keywords": [
-            "物理", "力学", "热力学", "电磁", "光学", "量子", "相对论",
-            "核物理", "流体力学", "固体物理", "声学", "粒子物理",
-            "牛顿", "爱因斯坦", "费曼", "薛定谔", "海森堡",
-            "加速度", "动能", "势能", "动量", "引力", "电场", "磁场",
-            "光速", "折射", "衍射", "干涉", "电磁波",
-        ],
-    },
     {
         "file":  "chemistry.json",
         "label": "Chemistry (化学)",
+        "anchors": ["化学", "化學", "有机化学", "無機化學", "无机化学", "化学元素", "化學元素"],
         "keywords": [
-            "化学", "元素", "元素周期表", "化合物", "分子", "原子", "离子",
-            "化学键", "氧化", "还原", "酸碱", "催化", "有机化学",
-            "无机化学", "高分子", "溶液", "浓度", "摩尔",
-            "居里", "门捷列夫", "拉瓦锡", "道尔顿",
-            "蛋白质", "酶", "氨基酸", "核酸",
+            "化学", "化學", "化学元素", "化學元素", "元素周期表", "週期表",
+            "化合物", "化学键", "化學鍵", "有机化学", "無機化學", "无机化学",
+            "化学反应", "化學反應", "化学式", "分子式", "化学计量", "摩尔",
+            "门捷列夫", "門捷列夫", "拉瓦锡", "拉瓦錫", "道尔顿", "道爾頓",
+            "居里", "酸碱", "酸鹼", "催化剂", "催化劑", "催化", "离子", "離子",
+            "高分子", "溶液", "浓度", "濃度", "氧化反应", "還原反應", "还原反应",
+            "化学工业", "化工原理", "谱学", "譜學",
         ],
     },
     {
-        "file":  "biology.json",
-        "label": "Biology (生物)",
+        "file":  "physics.json",
+        "label": "Physics (物理)",
+        "anchors": ["物理学", "物理學", "量子力学", "量子力學", "电磁学", "電磁學"],
         "keywords": [
-            "生物", "细胞", "基因", "DNA", "RNA", "染色体",
-            "进化", "自然选择", "遗传", "生态", "光合作用", "呼吸作用",
-            "细胞膜", "细胞核", "线粒体", "叶绿体", "核糖体",
-            "达尔文", "孟德尔", "沃森", "克里克",
-            "微生物", "细菌", "病毒", "真菌", "生态系统",
-        ],
-    },
-    {
-        "file":  "mathematics.json",
-        "label": "Mathematics (数学)",
-        "keywords": [
-            "数学", "代数", "几何", "微积分", "统计学", "概率论", "数论",
-            "拓扑", "线性代数", "微分方程", "函数", "极限", "导数", "积分",
-            "勾股定理", "欧拉", "高斯", "黎曼", "费马",
-            "矩阵", "向量", "行列式", "集合论",
-        ],
-    },
-    {
-        "file":  "astronomy.json",
-        "label": "Astronomy (天文)",
-        "keywords": [
-            "天文", "宇宙", "星系", "恒星", "行星", "黑洞", "中子星",
-            "太阳系", "银河系", "宇宙大爆炸", "暗物质", "暗能量", "红移",
-            "哈勃", "开普勒", "哥白尼", "伽利略",
-            "望远镜", "光年", "超新星", "白矮星",
-        ],
-    },
-    {
-        "file":  "earth_science.json",
-        "label": "Earth Science (地球科学)",
-        "keywords": [
-            "地质", "地球", "地震", "火山", "板块", "矿物", "岩石", "化石",
-            "气象", "气候", "大气", "海洋", "洋流", "潮汐",
-            "地壳", "地幔", "地核", "地形",
-        ],
-    },
-    {
-        "file":  "computer_science.json",
-        "label": "Computer Science (计算机科学)",
-        "keywords": [
-            "计算机", "算法", "数据结构", "人工智能", "机器学习", "神经网络",
-            "操作系统", "编译器", "数据库", "网络协议", "密码学",
-            "图灵", "冯·诺依曼", "香农", "半导体", "芯片",
-            "深度学习", "大语言模型",
+            "物理学", "物理學", "力学", "熱力學", "热力学", "电磁学", "电磁",
+            "光学", "量子力学", "量子", "相对论", "相對論", "核物理", "流体力学",
+            "固体物理", "声学", "粒子物理", "牛顿", "愛因斯坦", "爱因斯坦", "费曼",
+            "薛定谔", "海森堡", "加速度", "动能", "势能", "动量", "引力",
+            "电场", "磁场", "光速", "折射", "衍射", "干涉", "电磁波",
         ],
     },
     {
         "file":  "medicine.json",
         "label": "Medicine (医学)",
+        "anchors": ["医学", "醫學", "免疫", "病理", "病理學"],
         "keywords": [
-            "医学", "解剖", "生理", "免疫", "药理", "神经科学",
-            "基因组", "细胞生物学", "分子生物学",
-            "疾病", "诊断", "治疗", "手术", "疫苗", "抗体",
+            "医学", "醫學", "解剖", "生理", "免疫", "药理", "藥理", "神经科学",
+            "神經科學", "基因组", "基因組", "细胞生物学", "細胞生物學",
+            "分子生物学", "分子生物學", "疾病", "诊断", "診斷", "治疗", "治療",
+            "手术", "手術", "疫苗", "抗体", "抗體", "艾滋病", "愛滋病",
+            "HIV", "病原体", "病原體",
+        ],
+    },
+    {
+        "file":  "biology.json",
+        "label": "Biology (生物)",
+        "anchors": ["生物学", "生物學", "植物学", "植物學", "动物学", "動物學"],
+        "keywords": [
+            "生物学", "生物學", "细胞", "細胞", "基因", "DNA", "RNA", "染色体",
+            "染色體", "进化", "進化", "自然选择", "自然選擇", "遗传", "遺傳",
+            "生态", "生態", "光合作用", "呼吸作用", "细胞膜", "細胞膜",
+            "细胞核", "細胞核", "线粒体", "線粒體", "叶绿体", "葉綠體", "核糖体",
+            "达尔文", "達爾文", "孟德尔", "孟德爾", "沃森", "克里克",
+            "微生物", "细菌", "細菌", "病毒", "真菌", "生态系统", "生態系統",
+            "蛋白质", "蛋白質", "酶", "氨基酸", "核酸", "植物学", "植物學",
+            "动物学", "動物學", "古生物学", "古生物學",
+        ],
+    },
+    {
+        "file":  "mathematics.json",
+        "label": "Mathematics (数学)",
+        "anchors": ["数学", "數學", "数学家", "數學家"],
+        "keywords": [
+            "数学", "數學", "数学家", "數學家", "代数", "代數", "几何", "幾何",
+            "微积分", "微積分", "统计学", "統計學", "概率论", "概率論",
+            "数论", "數論", "拓扑", "拓撲", "线性代数", "線性代數",
+            "微分方程", "离散数学", "離散數學", "数理逻辑", "數理邏輯",
+            "函数", "函數", "极限", "極限", "导数", "導數", "积分", "積分",
+            "勾股定理", "欧拉", "歐拉", "高斯", "黎曼", "费马", "費馬",
+            "矩阵", "矩陣", "向量", "行列式", "集合论", "集合論",
+        ],
+    },
+    {
+        "file":  "computer_science.json",
+        "label": "Computer Science (计算机科学)",
+        "anchors": ["计算机科学", "計算機科學", "编程语言", "編程語言", "程序语言", "程式語言"],
+        "keywords": [
+            "计算机科学", "計算機科學", "程序设计", "程序設計", "程序语言",
+            "程式語言", "编程语言", "編程語言", "算法", "数据结构", "數據結構",
+            "人工智能", "机器学习", "機器學習", "神经网络", "神經網路",
+            "操作系统", "操作系統", "编译器", "編譯器", "数据库", "數據庫",
+            "网络协议", "網絡協議", "密码学", "密碼學", "图灵", "圖靈",
+            "冯·诺依曼", "馮·諾依曼", "香农", "香農", "芯片设计", "芯片設計",
+            "深度学习", "深度學習", "大语言模型", "大語言模型", "开源软件", "開源軟件",
+        ],
+    },
+    {
+        "file":  "astronomy.json",
+        "label": "Astronomy (天文)",
+        "anchors": ["天文学", "天文學", "天体", "天體"],
+        "keywords": [
+            "天文学", "天文學", "星系", "恒星", "恆星", "行星", "黑洞", "中子星",
+            "太阳系", "太陽系", "银河系", "銀河系", "宇宙大爆炸", "暗物质", "暗物質",
+            "暗能量", "红移", "紅移", "哈勃", "开普勒", "開普勒", "哥白尼",
+            "伽利略", "望远镜", "望遠鏡", "光年", "超新星", "白矮星", "天体", "天體",
+        ],
+    },
+    {
+        "file":  "earth_science.json",
+        "label": "Earth Science (地球科学)",
+        "anchors": ["地球科学", "地球科學", "地质学", "地質學", "气象学", "氣象學"],
+        "keywords": [
+            "地球科学", "地球科學", "地质", "地質", "地质学", "地質學",
+            "测绘", "測繪", "地球形状", "地球形狀", "地震", "火山", "板块", "板塊",
+            "矿物", "礦物", "岩石", "化石", "气象", "氣象", "气候", "氣候",
+            "大气", "大氣", "海洋", "洋流", "潮汐", "地壳", "地殼", "地幔", "地核", "地形",
         ],
     },
     {
         "file":  "engineering.json",
         "label": "Materials & Engineering (材料与工程)",
+        "anchors": ["材料科学", "材料科學", "机械工程", "機械工程", "土木工程", "化学工程", "化學工程"],
         "keywords": [
-            "材料", "纳米", "半导体", "合金", "陶瓷", "高分子材料",
-            "工程", "机械", "电子", "通信", "能源", "核能",
-            "航空", "航天", "土木", "化工",
+            "材料科学", "材料科學", "材料工程", "纳米材料", "納米材料",
+            "机械工程", "機械工程", "土木工程", "土木", "化工", "化学工程",
+            "化學工程", "航空", "航天", "核能", "通信工程", "电子工程", "電子工程",
+            "能源工程", "建筑工程", "冶金", "水利", "机器人", "機器人",
         ],
     },
 ]
 
-# Build a fast lookup: keyword → topic index
-_KW_TO_TOPIC: list[tuple[str, int]] = []
-for _idx, _t in enumerate(TOPICS):
-    for _kw in _t["keywords"]:
-        _KW_TO_TOPIC.append((_kw, _idx))
-# Sort by length descending so longer / more specific keywords match first
-_KW_TO_TOPIC.sort(key=lambda x: len(x[0]), reverse=True)
+# Pre-normalize anchor sets for scoring.
+_TOPIC_ANCHORS: list[set[str]] = [
+    {_normalize_zh(a) for a in t.get("anchors", [])} for t in TOPICS
+]
+_TOPIC_KEYWORDS: list[list[str]] = [t["keywords"] for t in TOPICS]
+
+
+def _score_topics(snippet: str) -> list[float]:
+    """Return weighted keyword scores for each topic on a normalized snippet."""
+    scores = [0.0] * len(TOPICS)
+    for idx, keywords in enumerate(_TOPIC_KEYWORDS):
+        seen: set[str] = set()
+        anchor_hit = False
+        for kw in keywords:
+            nkw = _normalize_zh(kw)
+            if len(nkw) < 2 or nkw in seen:
+                continue
+            if nkw not in snippet:
+                continue
+            seen.add(nkw)
+            scores[idx] += len(nkw)
+            if nkw in _TOPIC_ANCHORS[idx]:
+                anchor_hit = True
+        if anchor_hit:
+            scores[idx] += ANCHOR_BONUS
+    return scores
 
 
 def classify(text: str) -> int:
-    """Return the topic index (0-based) for this article, or -1 if no match."""
+    """Return the topic index with the clearest score, or -1 if ambiguous."""
     if len(text) < MIN_CHARS:
         return -1
-    snippet = text[:600]
-    for kw, idx in _KW_TO_TOPIC:
-        if kw in snippet:
-            return idx
-    return -1
+    snippet = _normalize_zh(text[:SNIPPET_LEN])
+    scores = _score_topics(snippet)
+    if not scores or max(scores) <= 0:
+        return -1
+
+    ranked = sorted(enumerate(scores), key=lambda x: x[1], reverse=True)
+    best_idx, best_score = ranked[0]
+    second_score = ranked[1][1] if len(ranked) > 1 else 0.0
+
+    if best_score < MIN_TOPIC_SCORE:
+        return -1
+    if second_score > 0 and (best_score - second_score) < MIN_SCORE_MARGIN:
+        return -1
+
+    has_anchor = any(
+        _normalize_zh(a) in snippet for a in TOPICS[best_idx].get("anchors", [])
+    )
+    if not has_anchor and best_score < STRONG_SCORE:
+        return -1
+
+    return best_idx
+
+
+def classify_detail(text: str) -> tuple[int, list[float]]:
+    """Like classify() but also return per-topic scores (for diagnostics)."""
+    if len(text) < MIN_CHARS:
+        return -1, [0.0] * len(TOPICS)
+    scores = _score_topics(_normalize_zh(text[:SNIPPET_LEN]))
+    return classify(text), scores
 
 
 # ── File & state helpers ────────────────────────────────────────────────────
@@ -342,19 +471,34 @@ def _load_hf_dataset(src: dict):
         print("ERROR: 'datasets' not installed.  Run: pip install datasets huggingface-hub")
         return None, None
     DOWNLOAD_PARQUET_NUM = 35
+    hf_token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
     for cfg in src["configs"]:
         try:
-            kwargs = dict(split=src["split"], trust_remote_code=True)
+            kwargs = dict(split=src["split"])
             if cfg is not None:
                 kwargs["name"] = cfg
 
-            if src["id"] == "chinese_edu_web":
+            if src["id"] == "cc100_zh":
+                glob = src["parquet_glob"].format(config=cfg)
+                kwargs = dict(
+                    split=src["split"],
+                    data_files={src["split"]: glob},
+                )
+                ds = hf_datasets.load_dataset("parquet", cache_dir=CACHE_DIR, **kwargs)
+            elif src["id"] == "chinese_edu_web":
                 file_list = [f"IndustryCorpus/{i:05d}.parquet" for i in range(DOWNLOAD_PARQUET_NUM)]
                 kwargs["data_files"] = {src["split"]: file_list}
                 # 关闭数据集大小校验，避免元数据和实际文件数量不一致报错
                 kwargs["verification_mode"] = "no_checks"
-
-            ds = hf_datasets.load_dataset(src["dataset"],cache_dir=CACHE_DIR,**kwargs)
+                ds = hf_datasets.load_dataset(src["dataset"], cache_dir=CACHE_DIR, **kwargs)
+            elif src["id"] == "cci3_hq":
+                if not hf_token:
+                    print(f"  {src['dataset']}: skipped (gated dataset — set HF_TOKEN to enable)")
+                    continue
+                kwargs["token"] = hf_token
+                ds = hf_datasets.load_dataset(src["dataset"], cache_dir=CACHE_DIR, **kwargs)
+            else:
+                ds = hf_datasets.load_dataset(src["dataset"], cache_dir=CACHE_DIR, **kwargs)
             label = f"{src['dataset']} ({cfg})" if cfg else src["dataset"]
             print(f"  Loaded {label}  ({len(ds):,} rows)")
             return ds, cfg
@@ -517,6 +661,54 @@ def cmd_verify():
     print("All files OK." if all_ok else "Some files FAILED checksum.")
 
 
+def cmd_refilter(state: dict):
+    """Reclassify all articles in topic JSON files using current rules."""
+    file_to_idx = {t["file"]: i for i, t in enumerate(TOPICS)}
+    buckets: list[list[str]] = [[] for _ in TOPICS]
+    kept = moved = dropped = 0
+
+    for fname, src_idx in file_to_idx.items():
+        path = os.path.join(OUTPUT_DIR, fname)
+        if not os.path.exists(path):
+            continue
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                text = json.loads(line)["text"]
+                dst = classify(text)
+                if dst == -1:
+                    dropped += 1
+                    continue
+                if dst != src_idx:
+                    moved += 1
+                else:
+                    kept += 1
+                buckets[dst].append(text)
+
+    for i, t in enumerate(TOPICS):
+        path = _out(i)
+        with open(path, "w", encoding="utf-8") as f:
+            for text in buckets[i]:
+                f.write(json.dumps({"text": text}, ensure_ascii=False) + "\n")
+
+    state["topic_bytes"] = {}
+    state["sealed_files"] = []
+    total = 0
+    for t in TOPICS:
+        path = os.path.join(OUTPUT_DIR, t["file"])
+        byt  = os.path.getsize(path) if os.path.exists(path) else 0
+        state["topic_bytes"][t["file"]] = byt
+        total += len(buckets[file_to_idx[t["file"]]])
+    state["total_articles"] = total
+    save_state(state)
+
+    print(f"\nRefilter complete.")
+    print(f"  Kept in place : {kept:,}")
+    print(f"  Moved         : {moved:,}")
+    print(f"  Dropped       : {dropped:,}  (no longer match any topic)")
+    print(f"  Total kept    : {total:,}")
+    _print_summary(state)
+
+
 def cmd_test_sources():
     """
     Try to load the first row from each source and show:
@@ -549,27 +741,47 @@ def cmd_test_sources():
         text = _get_text(row, src["text_fields"])
         print(f"  Text  : {repr(text[:200])}")
 
-        topic_idx = classify(text)
+        topic_idx, scores = classify_detail(text)
         if topic_idx == -1:
-            # Try a few more rows to see if any match
+            print(f"  Scores: {_format_top_scores(scores)}")
             matched = None
             for i in range(1, min(200, len(ds))):
                 t = _get_text(ds[i], src["text_fields"])
-                ti = classify(t)
+                ti, sc = classify_detail(t)
                 if ti != -1:
-                    matched = (i, ti, t)
+                    matched = (i, ti, t, sc)
                     break
             if matched:
-                i, ti, t = matched
+                i, ti, t, sc = matched
                 print(f"  Class : row 0 = no match; first match at row {i} "
                       f"-> {TOPICS[ti]['label']}")
+                print(f"  Scores: {_format_top_scores(sc)}")
                 print(f"  Sample: {repr(t[:200])}")
             else:
                 print(f"  Class : no science match in first 200 rows "
-                      f"(keywords may not match this dataset's style)")
+                      f"(scores too low or ambiguous)")
         else:
             print(f"  Class : row 0 -> topic {topic_idx} = {TOPICS[topic_idx]['label']}")
+            print(f"  Scores: {_format_top_scores(scores)}")
         print()
+
+
+def _apply_classify_config(args) -> None:
+    """Override scoring thresholds from CLI (defaults live in module constants)."""
+    global MIN_TOPIC_SCORE, MIN_SCORE_MARGIN, STRONG_SCORE
+    MIN_TOPIC_SCORE = args.min_topic_score
+    MIN_SCORE_MARGIN = args.min_score_margin
+    STRONG_SCORE = args.strong_score
+
+
+def _format_top_scores(scores: list[float], n: int = 3) -> str:
+    ranked = sorted(enumerate(scores), key=lambda x: x[1], reverse=True)
+    parts = []
+    for idx, score in ranked[:n]:
+        if score <= 0:
+            break
+        parts.append(f"{TOPICS[idx]['file']}={score:.0f}")
+    return ", ".join(parts) if parts else "none"
 
 
 # ── Entry point ─────────────────────────────────────────────────────────────
@@ -594,19 +806,31 @@ def parse_args():
                    help="Max new articles to write this run (default: 2000).")
     p.add_argument("--status",       action="store_true", help="Show progress and exit.")
     p.add_argument("--verify",       action="store_true", help="Verify SHA-256 checksums.")
+    p.add_argument("--refilter",     action="store_true",
+                   help="Reclassify existing topic JSON files with current rules.")
     p.add_argument("--test-sources", action="store_true",
                    help="Check each source: reachable? fields? sample text? classification?")
-    p.add_argument("--cache-dir", default="/mnt/build/llm_data",
-                   help="Directory for scienceN.json files (default: .).")
+    p.add_argument("--cache-dir", default=_default_cache_dir(),
+                   help="Hugging Face cache directory (default: ~/Documents/data/hf_cache).")
+    p.add_argument("--min-topic-score", type=int, default=MIN_TOPIC_SCORE,
+                   help="Minimum weighted score to assign a topic (default: %(default)s).")
+    p.add_argument("--min-score-margin", type=int, default=MIN_SCORE_MARGIN,
+                   help="Winner must lead runner-up by this margin (default: %(default)s).")
+    p.add_argument("--strong-score", type=int, default=STRONG_SCORE,
+                   help="Score that qualifies without an anchor match (default: %(default)s).")
     return p.parse_args()
 
 
 def main():
-    global OUTPUT_DIR,CACHE_DIR
+    global OUTPUT_DIR, CACHE_DIR
     args       = parse_args()
+    _apply_classify_config(args)
     OUTPUT_DIR = os.path.abspath(args.output_dir)
-    CACHE_DIR = os.path.abspath(args.cache_dir)
+    CACHE_DIR  = os.path.abspath(args.cache_dir)
+    os.environ["HF_HUB_CACHE"]      = os.path.join(CACHE_DIR, "hub")
+    os.environ["HF_DATASETS_CACHE"] = os.path.join(CACHE_DIR, "datasets")
     os.makedirs(OUTPUT_DIR, exist_ok=True)
+    os.makedirs(CACHE_DIR, exist_ok=True)
     print(f"Output directory: {OUTPUT_DIR}")
 
     state = load_state()
@@ -615,6 +839,8 @@ def main():
         cmd_status(state)
     elif args.verify:
         cmd_verify()
+    elif args.refilter:
+        cmd_refilter(state)
     elif args.test_sources:
         cmd_test_sources()
     else:
