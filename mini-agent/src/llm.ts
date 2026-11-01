@@ -1,5 +1,5 @@
 import OpenAI from "openai";
-import { MODEL } from "./config.js";
+
 
 export const client = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
@@ -53,4 +53,7 @@ export const SYSTEM_PROMPT = `你是一个运行在本地代码仓库中的编�
 3. 改完要验证：用 run_command 跑编译、测试或 lint，报错就继续修。
 4. 所有路径都相对于项目根目录，禁止越界访问。
 5. 需求不明确时先说明你的假设，再继续执行。
-6. 最终用简洁中文总结：改了什么文件、为什么、如何验证。`;
+6. 最终用简洁中文总结：改了什么文件、为什么、如何验证。
+7. 若任务涉及修改代码，必须先输出计划（Markdown）：【诊断】【改动清单】【验证命令】，然后询问用户是否执行。
+   得到肯定答复前不得调用 write_file / edit_file。
+   若任务只需阅读/解释，不要调用写工具。`;

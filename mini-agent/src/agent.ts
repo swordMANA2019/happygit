@@ -1,8 +1,9 @@
+import OpenAI from "openai";
 import { client, TOOLS, SYSTEM_PROMPT } from "./llm.js";
 import { readFile, writeFile, editFile, listFiles } from "./tools/fs.js";
 import { searchCode } from "./tools/search.js";
 import { runCommand } from "./tools/shell.js";
-import { MAX_STEPS, MODEL } from "./config.js";
+import { MAX_STEPS, MODEL , TOOL_OUTPUT_CAP} from "./config.js";
 
 type Msg = OpenAI.Chat.Completions.ChatCompletionMessageParam;
 
@@ -14,7 +15,7 @@ async function dispatch(name: string, args: any): Promise<string> {
       case "edit_file":   return await editFile(args.path, args.old_text, args.new_text);
       case "list_files":  return await listFiles(args.path ?? ".", args.depth ?? 3);
       case "search_code": return await searchCode(args.query, args.max_results ?? 40);
-      case "run_command": return await runCommand(args.command);
+      case "run_command": return await runCommand(args.command, { cwd: args.cwd, timeoutMs: args.timeout_ms });
       default:            return `未知工具：${name}`;
     }
   } catch (e: any) {
@@ -51,7 +52,7 @@ export async function runTask(task: string, context: string) {
       console.log(`\n[步骤 ${step}] ${fn} ${JSON.stringify(args).slice(0, 160)}`);
       const result = await dispatch(fn, args);
       console.log(result.slice(0, 300) + (result.length > 300 ? " …" : ""));
-      messages.push({ role: "tool", tool_call_id: tc.id, content: result.slice(0, 20000) });
+      messages.push({ role: "tool", tool_call_id: tc.id, content: result.slice(0, TOOL_OUTPUT_CAP) });
     }
   }
   return "已达到最大步数上限，任务未完成，请拆分后重试。";

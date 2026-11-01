@@ -15,3 +15,8 @@ export const TEXT_EXT = new Set([
   ".java", ".c", ".h", ".cpp", ".sh", ".yml", ".yaml", ".toml",
   ".css", ".html", ".sql",
 ]);
+
+export const TOOL_OUTPUT_CAP = 20000;
+export const ERROR_DIGEST = 6000;
+export const MANIFEST_TTL_MS = 24 * 3600000;
+export const MAX_RETRIES = 3;

@@ -1,20 +1,24 @@
 import { exec } from "node:child_process";
+import { promisify } from "node:util";
 
-const ALLOW = new Set([
-  "ls", "cat", "grep", "rg", "find", "wc", "head", "tail", "pwd", "echo",
-  "git", "node", "npm", "pnpm", "yarn", "tsc", "python", "pytest",
-  "cargo", "go", "make",
-]);
+const execAsync = promisify(exec);
 
-export function runCommand(command: string, timeoutMs = 60_000) {
-  const bin = command.trim().split(/\s+/)[0];
-  if (!ALLOW.has(bin)) {
-    return Promise.resolve(`命令被拒绝：${bin} 不在白名单内`);
-  }
-  return new Promise<string>((resolve) => {
-    exec(command, { timeout: timeoutMs, maxBuffer: 4 * 1024 * 1024 }, (err, stdout, stderr) => {
-      const out = [stdout, stderr].filter(Boolean).join("\n").slice(0, 8000);
-      resolve(err ? `退出码异常：\n${out}` : out || "（无输出）");
+export async function runCommand(
+  command: string,
+  opts: { cwd?: string; timeoutMs?: number } = {}
+): Promise<string> {
+  const cwd = opts.cwd ?? process.cwd();
+  const timeout = opts.timeoutMs ?? 60_000;
+  try {
+    const { stdout, stderr } = await execAsync(command, {
+      cwd,
+      timeout,
+      maxBuffer: 20 * 1024 * 1024,
+      env: { ...process.env, CI: "1", NO_COLOR: "1", FORCE_COLOR: "0" },
     });
-  });
+    return (stdout + stderr).trim() || "(命令执行成功，无输出)";
+  } catch (e: any) {
+    const out = (e.stdout ?? "") + (e.stderr ?? "") + String(e);
+    return out.trim() || `命令失败：${e.message}`;
+  }
 }
