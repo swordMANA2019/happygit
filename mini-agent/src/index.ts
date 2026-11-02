@@ -1,27 +1,23 @@
+// src/index.ts —— 只改头部这几行
 import readline from "node:readline/promises";
 import { stdin, stdout } from "node:process";
-import { runTask } from "./agent.js";
-import { buildContext } from "./context.js";
-import { runFixTask, type FixOpts } from "./fix.js";
-import { diagnose } from "./diagnose.js";
+import fs from "node:fs/promises";
+import path from "node:path";
 import { route, type Mode } from "./router.js";
-import { ensureManifest, invalidateManifest } from "./probe.js";
-import { MODEL, ROOT } from "./config.js";
+import { MODEL } from "./config.js";
+import { Session } from "./session.js";
 
-/* ---- 工具函数 ---- */
+type Branch = Mode | "diag";   // diag 是本地流程分支，不属于意图分类
 
-function printBanner() {
-  console.log(`Mini Agent | 模型：${MODEL} | 根目录：${ROOT}`);
-  console.log("命令：/fix <任务> 强制修复 | /edit 只改不重试 | /ask 只问答");
-  console.log("      /diag 诊断模式 | /probe 重探验证器 | /context 查看上下文");
-  console.log("      /model <名> 切换模型 | /reset 清空历史 | /exit 退出");
+function printBanner(ses: Session) {
+  console.log(`Mini Agent | 模型：${ses.model} | 目录：${ses.cwd}`);
+  console.log("命令：/fix <任务> | /edit | /ask | /diag | /probe | /context | /model <名> | /reset | /exit");
 }
 
-/** 打印诊断报告，并让用户选择要修哪几条 */
 async function askWhichToFix(rl: readline.Interface, report: string): Promise<string | null> {
   console.log(`\n${report}`);
   while (true) {
-    const ans = (await rl.question("\n要修复哪些？输入编号（如 1,3）／y 全部／n 放弃：")).trim().toLowerCase();
+    const ans = (await rl.question("\n要修复哪些？编号(如 1,3) / y 全部 / n 放弃：")).trim().toLowerCase();
     if (ans === "n" || ans === "no") return null;
     if (ans === "y" || ans === "yes" || ans === "") return "__all__";
     if (/^\d[\d,\s]*$/.test(ans)) return ans;
@@ -29,28 +25,33 @@ async function askWhichToFix(rl: readline.Interface, report: string): Promise<st
   }
 }
 
-/** 从诊断报告中抽取第 N 条（简单实现：按行号/序号切分） */
 function pickIssues(report: string, spec: string): string {
-  const lines = report.split("\n").filter((l) => l.trim());
-  const nums = spec.split(/[,，\s]+/).map((s) => parseInt(s, 10)).filter((n) => !Number.isNaN(n));
-  // 粗略策略：把报告按 "## " 分块，取对应块；没有块就原样返回
   const blocks = report.split(/^##\s+/m).filter((b) => b.trim());
   if (blocks.length === 0) return report;
+  const nums = spec.split(/[,，\s]+/).map((s) => parseInt(s, 10)).filter((n) => !Number.isNaN(n));
   return nums.map((n) => blocks[n - 1]).filter(Boolean).join("\n## ") || report;
 }
 
-/* ---- 主循环 ---- */
+async function appendAudit(record: unknown) {
+  try {
+    const dir = path.join(process.cwd(), ".agent");
+    await fs.mkdir(dir, { recursive: true });
+    await fs.appendFile(path.join(dir, "fix-log.jsonl"), JSON.stringify(record) + "\n");
+  } catch {
+    /* ignore */
+  }
+}
 
 async function main() {
+  const ses = new Session(process.cwd(), MODEL);
   const argTask = process.argv.slice(2).join(" ").trim();
-
-  // CLI 单次调用：直接跑，不走路由
   if (argTask) {
-    console.log(await runTask(argTask, await buildContext()));
+    console.log(await ses.ask(argTask, await ses.context()));
     return;
   }
 
-  printBanner();
+  printBanner(ses);
+  
   const rl = readline.createInterface({ input: stdin, output: stdout });
   let history: string[] = [];
 
@@ -58,74 +59,87 @@ async function main() {
     while (true) {
       const input = (await rl.question("\n你> ")).trim();
       if (!input) continue;
-
-      // —— 内置命令（保持你原来的结构） ——
       if (input === "/exit" || input === "/quit") break;
-      if (input === "/context") { console.log(await buildContext()); continue; }
-      if (input === "/probe") { await invalidateManifest(); console.log(await ensureManifest()); continue; }
-      if (input.startsWith("/model ")) { process.env.AGENT_MODEL = input.slice(7).trim(); console.log("已切换模型"); continue; }
-      if (input === "/reset") { history = []; console.log("上下文已清空"); continue; }
-
-      // —— 显式模式覆盖：用户说了算，跳过 LLM 路由 ——
-      let forced: Mode | null = null;
+      if (input === "/context") { console.log(await ses.context()); continue; }
+      if (input === "/probe") {
+        await ses.probe();
+        console.log(`已重新探测了${ses.cwd}`);
+        continue;
+      }
+      if (input.startsWith("/model ")) {
+        const m = input.slice(7).trim();
+        process.env.AGENT_MODEL = m;
+        ses.model = m;
+        console.log(`已切换模型：${m}`);
+        continue;
+      }
+      if (input === "/reset") {
+        history.length = 0;
+        console.log("上下文已清空");
+        continue;
+      }
+      if (input === "/pwd") {
+        console.log(ses.cwd);
+        continue;
+      }
+      // 显式覆盖：这里允许 "diag"
+      let forced: Branch | null = null;
       let body = input;
-      if (input.startsWith("/fix ")) { forced = "fix"; body = input.slice(5).trim(); }
+      if (input.startsWith("/fix ")) {forced = "fix"; body = input.slice(5).trim(); }
       else if (input.startsWith("/edit ")) { forced = "edit"; body = input.slice(6).trim(); }
       else if (input.startsWith("/ask ")) { forced = "ask"; body = input.slice(5).trim(); }
       else if (input.startsWith("/diag ")) { forced = "diag"; body = input.slice(6).trim(); }
 
-      // —— LLM 意图路由（失败自动降级到关键词） ——
-      const r = forced ? { mode: forced, reason: "(forced by command)", missing: [] } : await route(input);
-      console.error(`[router] ${r.mode} | ${r.reason}`);
+      const r = forced ? { mode: forced as Mode, reason: "(forced)", missing: [] } : await route(input);
+      const branch: Branch = forced ?? r.mode;
+      console.error(`[router] ${branch} | ${r.reason}`);
 
-      // 信息不足就先反问，不要瞎猜动手
-      if (r.mode === "clarify") {
-        console.log(`\n我需要先确认几点才能动手：\n${r.missing.map((m, i) => `${i + 1}. ${m}`).join("\n")}\n\n补充后重新发送，或直接使用 /fix 强制进入修复模式。`);
+      if (r.mode === "clarify" && !forced) {
+        console.log(`\n我需要先确认几点：\n${r.missing.map((m, i) => `${i + 1}. ${m}`).join("\n")}\n\n补充后重发，或 /fix 强制进入修复模式。`);
         continue;
       }
 
-      // —— ask：纯问答，走原来的路径，记历史 ——
-      if (r.mode === "ask") {
-        const ctx = await buildContext();
+      if (branch === "ask") {
+        const ctx = await ses.context();
         const memo = history.length ? `此前对话摘要：\n${history.join("\n---\n")}\n\n` : "";
-        const answer = await runTask(memo + input, ctx);
+        const answer = await ses.ask(memo + input, ctx);
         console.log(`\n助手> ${answer}`);
         history.push(`用户：${input}\n助手：${answer}`.slice(0, 2000));
         if (history.length > 5) history.shift();
         continue;
       }
 
-      // —— diag：只读诊断，出报告等人确认 ——
-      if (r.mode === "fix" && (forced === "diag" || input.includes("找出") || input.includes("缺陷") || input.includes("问题"))) {
+      // diag：只读诊断 → 出报告 → 等人选
+      if (branch === "diag" || (branch === "fix" && /(找出|缺陷|问题|哪里不对|有什么毛病)/.test(input))) {
         console.error("[diag] 只读诊断中…");
-        const { report, hasRealErrors } = await diagnose(body);
+        const { report } = await ses.diagnose(body);
         const which = await askWhichToFix(rl, report);
         if (!which) { console.log("已取消，未做任何修改。"); continue; }
         body = which === "__all__" ? report : pickIssues(report, which);
-        // 落到下面的 fix 闭环，逐条修
       }
 
-      // —— edit / fix：统一进验证闭环，参数不同 ——
-      const opts: FixOpts = {
-        autoRetry: r.mode === "fix",     // fix 自动重试 MAX_RETRIES 次；edit 只跑一轮
-        requireConfirm: r.mode === "edit",
-      };
-      const res = await runFixTask(body, ROOT, opts);
-      console.log(res.status === "fixed"
-        ? `\n✅ 修复成功（${res.attempts} 轮）\n${res.log}`
-        : `\n❌ 修复失败，已回滚到修复前状态\n${res.log}`);
+      // edit/fix 进闭环
+      const res = await ses.fix(body, {
+        autoRetry: branch === "fix",
+        requireConfirm: branch === "edit",
+      });
 
-      // 顺手记一笔审计（可选，但强烈建议留着）
-      try {
-        await import("node:fs/promises").then(async (fs) => {
-          const line = JSON.stringify({
-            ts: Date.now(), mode: r.mode, task: body.slice(0, 200),
-            status: res.status, attempts: res.attempts,
-          }) + "\n";
-          await fs.mkdir(`${ROOT}/.agent`, { recursive: true });
-          await fs.appendFile(`${ROOT}/.agent/fix-log.jsonl`, line);
-        });
-      } catch {}
+      if (res.status === "fixed") {
+        console.log(`\n✅ 修复成功（${res.attempts} 轮）\n${res.log}`);
+      } else if (res.status === "denied") {
+        console.log("\n⛔ 用户拒绝变更，已回滚");
+      } else {
+        console.log(`\n❌ 修复失败，已回滚\n${res.log}`);
+      }
+
+      await appendAudit({
+        ts: Date.now(),
+        cwd: ses.cwd,
+        branch,
+        task: body.slice(0, 200),
+        status: res.status,
+        attempts: res.attempts,
+      });
     }
   } finally {
     rl.close();

@@ -21,7 +21,7 @@ const DIAGNOSE_PROMPT = `你是代码诊断员，当前为只读模式，不得�
 
 export type DiagnoseResult = { report: string; hasRealErrors: boolean };
 
-export async function diagnose(task: string, root = process.cwd()): Promise<DiagnoseResult> {
+export async function diagnose(task: string, root: string,sessionId:string, model: string = "gpt-4"): Promise<DiagnoseResult> {
   const manifest = await ensureManifest(root);
   const cmds = manifest.verifyCommands.length ? manifest.verifyCommands : fallbackCmds(manifest.lang);
 
@@ -39,7 +39,7 @@ export async function diagnose(task: string, root = process.cwd()): Promise<Diag
   try {
     const ctx = await buildContext(root);
     const prompt = DIAGNOSE_PROMPT.replace("{verifyOutput}", verifyOutput);
-    const report = await runTask(`${prompt}\n\n用户任务：${task}`, ctx);
+    const report = await runTask(`${prompt}\n\n用户任务：${task}`, ctx, root, sessionId, model);
     return { report, hasRealErrors };
   } finally {
     delete process.env.AGENT_READONLY;
