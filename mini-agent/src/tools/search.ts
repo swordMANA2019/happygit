@@ -1,67 +1,54 @@
-import { exec } from "node:child_process";
-import { promisify } from "node:util";
 import fs from "node:fs/promises";
 import path from "node:path";
+import { IGNORE, TEXT_EXT } from "../config.js";
+import { isSensitivePath } from "../guard.js";
 
-const execAsync = promisify(exec);
+const esc = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+const MAX_FILE_BYTES = 1024 * 1024;
 
-let _hasRg: boolean | undefined;
-async function hasRg(root: string): Promise<boolean> {
-  if (_hasRg !== undefined) return _hasRg;
-  try { await execAsync("rg --version", { cwd: root, timeout: 3000 }); _hasRg = true; } catch { _hasRg = false; }
-  return _hasRg;
-}
+export async function searchCode(root: string, query: string, maxResults = 40) {
+  if (!query) return "query 不能为空";
+  const re = new RegExp(esc(query), "i");
+  const hits: string[] = [];
+  let skipped = 0;
 
-export async function searchCode(root: string, query: string, maxResults = 40): Promise<string> {
-  if (await hasRg(root)) {
+  async function walk(dir: string) {
+    if (hits.length >= maxResults) return;
+    let entries;
     try {
-      const q = query.replace(/"/g, '\\"');
-      const { stdout } = await execAsync(`rg --line-number --no-heading --max-count=${maxResults} "${q}" .`, {
-        cwd: root, timeout: 15_000, maxBuffer: 10 * 1024 * 1024,
-      });
-      return stdout.trim() || "未找到匹配";
-    } catch {}
-  }
-  return grepFallback(root, query, maxResults);
-}
-
-/** 按文件名查找，返回相对路径列表（用于路径纠错） */
-export async function findFilesByName(root: string, name: string, limit = 10): Promise<string[]> {
-  const needle = name.toLowerCase();
-  const out: string[] = [];
-  const walk = async (dir: string, depth = 6) => {
-    if (depth < 0 || out.length >= limit) return;
-    for (const e of await fs.readdir(dir, { withFileTypes: true })) {
-      if (e.name.startsWith(".") || e.name === "node_modules" || e.name === "dist" || e.name === "build") continue;
-      const p = path.join(dir, e.name);
-      if (e.isDirectory()) { await walk(p, depth - 1); continue; }
-      if (e.name.toLowerCase() === needle || e.name.toLowerCase().includes(needle)) {
-        out.push(path.relative(root, p));
-        if (out.length >= limit) return;
+      entries = await fs.readdir(dir, { withFileTypes: true });
+    } catch {
+      skipped++;               // 权限不足 / 目录被删：跳过，不要让整个搜索失败
+      return;
+    }
+    for (const e of entries) {
+      if (hits.length >= maxResults) return;
+      if (IGNORE.has(e.name)) continue;
+      const full = path.join(dir, e.name);
+      if (e.isDirectory()) {
+        await walk(full);
+      } else if (TEXT_EXT.has(path.extname(e.name)) && !isSensitivePath(path.relative(root, full))) {
+        let text: string;
+        try {
+          const st = await fs.stat(full);
+          if (st.size > MAX_FILE_BYTES) { skipped++; continue; }
+          text = await fs.readFile(full, "utf8");
+        } catch {
+          skipped++;
+          continue;
+        }
+        const lines = text.split(/\r?\n/);
+        for (let i = 0; i < lines.length; i++) {
+          if (re.test(lines[i])) {
+            hits.push(`${path.relative(root, full)}:${i + 1}: ${lines[i].trim().slice(0, 200)}`);
+            if (hits.length >= maxResults) break;
+          }
+        }
       }
     }
-  };
-  try { await walk(root); } catch {}
-  return out;
-}
+  }
 
-async function grepFallback(root: string, query: string, max = 40): Promise<string> {
-  const results: string[] = [];
-  const walk = async (dir: string) => {
-    for (const e of await fs.readdir(dir, { withFileTypes: true })) {
-      if (e.name.startsWith(".") || e.name === "node_modules") continue;
-      const p = path.join(dir, e.name);
-      if (e.isDirectory()) { await walk(p); continue; }
-      try {
-        const txt = await fs.readFile(p, "utf-8");
-        txt.split("\n").forEach((l, i) => {
-          if (l.includes(query)) results.push(`${path.relative(root, p)}:${i + 1}: ${l.trim()}`);
-        });
-      } catch {}
-    }
-  };
   await walk(root);
-  return results.slice(0, max).join("\n") || "未找到匹配";
+  const tail = skipped ? `\n（另有 ${skipped} 个文件/目录因过大或无法读取被跳过）` : "";
+  return hits.length ? hits.join("\n") + tail : `未找到匹配：${query}${tail}`;
 }
-
-export { execAsync };

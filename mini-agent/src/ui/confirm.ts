@@ -1,5 +1,6 @@
-import readline from "node:readline/promises";
-import type { FileOp } from "../proposal.js";
+import type { FileOp } from "../policy.js";
+import { diffSummary } from "../policy.js";
+import { unifiedDiff } from "../workspace.js";
 
 const G = "\x1b[32m";
 const R = "\x1b[31m";
@@ -7,77 +8,37 @@ const Y = "\x1b[33m";
 const B = "\x1b[1m";
 const X = "\x1b[0m";
 
-export async function confirmTerminal(ops: FileOp[]): Promise<boolean> {
-  if (ops.length === 0) return true;
+/** 提问函数由 Session 注入——全程只用一个 readline，避免两个接口抢 stdin */
+export type AskFn = (question: string) => Promise<string>;
+export type Approval = "yes" | "no" | "always";
+
+export async function confirmOps(ask: AskFn, ops: FileOp[]): Promise<Approval> {
+  if (ops.length === 0) return "yes";
   console.log(`\n${B}── 待确认变更 (${ops.length} 个文件) ──${X}`);
-  for (let i = 0; i < ops.length; i++) {
-    const f = ops[i];
+  ops.forEach((f, i) => {
     const tag =
-      f.risk === "high"
-        ? `${R}[${f.risk.toUpperCase()}]${X}`
-        : f.risk === "medium"
-        ? `${Y}[${f.risk}]${X}`
-        : `${G}[${f.risk}]${X}`;
-    console.log(`${i + 1}. ${tag} ${f.path}`);
-    console.log(`   ← ${f.reason}  (${diffSummary(f)})`);
+      f.risk === "high" ? `${R}[HIGH]${X}` : f.risk === "medium" ? `${Y}[medium]${X}` : `${G}[low]${X}`;
+    console.log(`${i + 1}. ${tag} ${f.action} ${f.path}`);
+    console.log(`   ← ${f.reason || "(无说明)"}  (${diffSummary(f)})`);
     if (f.resolved.note) console.log(`   ⚠ ${f.resolved.note}`);
-  }
-  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-  try {
-    while (true) {
-      const ans = (await rl.question("\n应用？ [Y]es / [n]o / [e]看diff / [1-9]看单个: ")).trim().toLowerCase();
-      if (!ans || ans === "y" || ans === "yes") return true;
-      if (ans === "n" || ans === "no") return false;
-      if (ans === "e") {
-        for (const f of ops) console.log(`\n${B}${f.path}${X}\n${makeDiff(f)}`);
-        continue;
-      }
-      const i = parseInt(ans, 10) - 1;
-      if (i >= 0 && i < ops.length) {
-        console.log(`\n${B}${ops[i].path}${X}\n${makeDiff(ops[i])}`);
-        continue;
-      }
+  });
+
+  while (true) {
+    const ans = (await ask("\n应用？ [Y]es / [n]o / [a]lways(本会话同一文件不再问) / [d]iff: ")).trim().toLowerCase();
+    // 空串也可能来自"输入被中断"，此时必须按拒绝处理，而不是默认同意
+    if (ans === "y" || ans === "yes") return "yes";
+    if (ans === "n" || ans === "no" || ans === "") return "no";
+    if (ans === "a" || ans === "always") return "always";
+    if (ans === "d" || ans === "diff") {
+      for (const f of ops) console.log(`\n${B}${f.path}${X}\n${makeDiff(f)}`);
     }
-  } finally {
-    rl.close();
   }
 }
 
-export async function pickCandidate(cands: string[], asked: string): Promise<string | null> {
-  console.log(`\n${B}未找到 "${asked}"，请选择正确的文件：${X}`);
-  cands.forEach((c, i) => console.log(`  ${i + 1}. ${c}`));
-  console.log("  0. 都不是，我手动输入");
-  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-  try {
-    const ans = (await rl.question("> ")).trim();
-    const n = parseInt(ans, 10);
-    if (Number.isInteger(n) && n >= 1 && n <= cands.length) return cands[n - 1];
-    if (ans === "0") {
-      const manual = (await rl.question("请输入路径: ")).trim();
-      return manual || null;
-    }
-    return null;
-  } finally {
-    rl.close();
-  }
+function makeDiff(op: FileOp): string {
+  return unifiedDiff(op.path, op.action === "create" ? null : op.before, op.action === "delete" ? null : op.after) || "(无差异)";
 }
 
 export function autoAllowed(): boolean {
   return process.argv.includes("--yes") || process.env.AGENT_AUTO_APPROVE === "1";
-}
-
-function makeDiff(op: FileOp): string {
-  const lines: string[] = [`--- a/${op.path}`, `+++ b/${op.path}`];
-  const afterLines = op.after.split("\n");
-  const beforeSet = new Set(op.before.split("\n"));
-  for (const l of afterLines) {
-    lines.push(beforeSet.has(l) ? ` ${l}` : `+${l}`);
-  }
-  return lines.join("\n");
-}
-
-function diffSummary(op: FileOp): string {
-  const a = op.before.split("\n").length;
-  const b = op.after.split("\n").length;
-  return `+${Math.max(0, b - a)}/-${Math.max(0, a - b)}`;
 }

@@ -3,3 +3,8 @@ node_modules/
 .env
 bun.lock
 package-lock.json
+dist/
+.test-dist/
+# bun build --compile 的产物
+/mini-agent
+/mini-agent.exe

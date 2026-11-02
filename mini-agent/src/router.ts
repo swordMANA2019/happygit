@@ -22,10 +22,10 @@ const PROMPT = `你是意图路由器，只做分类，不执行、不回答。�
 "这个项目怎么跑起来" → ask
 "优化一下" → clarify（missing: ["优化目标：速度/可读性/内存/覆盖率"])`;
 
-export async function route(input: string): Promise<{ mode: Mode; reason: string; missing: string[] }> {
+export async function route(input: string, model: string = MODEL): Promise<{ mode: Mode; reason: string; missing: string[] }> {
   try {
     const resp = await client.chat.completions.create({
-      model: MODEL, // 建议换成便宜的小模型，如 gpt-4o-mini / qwen-turbo
+      model,                     // 建议换成便宜的小模型，如 gpt-4o-mini / qwen-turbo
       messages: [{ role: "system", content: PROMPT }, { role: "user", content: input }],
       temperature: 0,
       response_format: { type: "json_object" },

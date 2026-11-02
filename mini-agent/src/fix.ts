@@ -1,229 +1,248 @@
-import { exec } from "node:child_process";
-import { promisify } from "node:util";
-import fs from "node:fs/promises";
+import OpenAI from "openai";
 import path from "node:path";
-import { client } from "./llm.js";
-import { runTask } from "./agent.js";
+import { runAgent } from "./agent.js";
 import { buildContext } from "./context.js";
-import { MAX_RETRIES, ERROR_DIGEST } from "./config.js";
-import { ensureManifest } from "./probe.js";
+import crypto from "node:crypto";
+import { MODEL, MAX_RETRIES, ERROR_DIGEST, VERIFY_TIMEOUT_MS } from "./config.js";
+import type { ApproveFn } from "./tools/ctx.js";
+import { ensureManifest, type Manifest } from "./probe.js";
 import { runCritic, shouldSkipCritic } from "./critic.js";
-import { execAsyncPromised } from "./tools/shell.js";
-import {
-  classify,
-  groupOps,
-  proposalId,
-  diffSummary,
-  type FileOp,
-  type Proposal,
-} from "./proposal.js";
-import { confirmTerminal, autoAllowed } from "./ui/confirm.js";
-import { setAllowed, clearAllowed, resolvePath } from "./guard.js";
+import { execCommand } from "./tools/shell.js";
+import { Workspace, gitInfo, untrackedSideEffects } from "./workspace.js";
+import { stripAnsi, truncateMiddle } from "./util.js";
+import type { FailureKind } from "./errors.js";
 
-const execAsync = promisify(exec);
+type Msg = OpenAI.Chat.Completions.ChatCompletionMessageParam;
 
-/* ---- git ---- */
+/* =========================================================================
+ * 验证
+ * ========================================================================= */
 
-export async function gitCheckpoint(root: string, label: string): Promise<string> {
-  const name = `agent/${label}-${Date.now()}`;
-  await execAsync("git add -A", { cwd: root });
-  await execAsync('git commit -m "checkpoint"', { cwd: root }).catch(() => {});
-  await execAsync(`git branch -f ${name}`, { cwd: root });
-  return name;
-}
+export type VerifyResult = {
+  ok: boolean;
+  stdout: string;
+  stderr: string;
+  cmd: string;
+  /** ok=false 时：code=代码有问题；env/timeout=验证器本身没跑起来（结论不可信） */
+  kind: "ok" | FailureKind;
+  reason: string;
+  code: number | null;
+};
 
-export async function gitRollback(root: string, ref: string): Promise<void> {
-  await execAsync("git reset --hard HEAD", { cwd: root });
-  await execAsync("git clean -fd", { cwd: root }).catch(() => {});
-  await execAsync(`git checkout ${ref} -- .`, { cwd: root });
-}
-
-async function gitDiff(root: string): Promise<string> {
-  try {
-    const { stdout } = await execAsync("git diff HEAD", { cwd: root, maxBuffer: 5 * 1024 * 1024 });
-    return stdout;
-  } catch {
-    return "";
-  }
-}
-
-/* ---- 验证 ---- */
-
-export type VerifyResult = { ok: boolean; stdout: string; stderr: string; cmd: string };
-
-export async function runVerify(root: string, cmd: string): Promise<VerifyResult> {
-  try {
-    const { stdout, stderr } = await execAsync(cmd, {
-      cwd: root,
-      timeout: 90_000,
-      maxBuffer: 20 * 1024 * 1024,
-      env: { ...process.env, CI: "1", NO_COLOR: "1", FORCE_COLOR: "0" },
-    });
-    return { ok: true, stdout, stderr, cmd };
-  } catch (e: any) {
-    return { ok: false, stdout: e.stdout ?? "", stderr: e.stderr ?? String(e), cmd };
-  }
-}
-
-function fallbackCmd(lang: string): string {
-  return ({ python: "python -m compileall -q .", go: "go build ./...", rust: "cargo check", java: "mvn compile -q" } as Record<string, string>)[lang] ?? "echo 'no verifier'";
+export async function runVerify(root: string, cmd: string, signal?: AbortSignal): Promise<VerifyResult> {
+  const r = await execCommand(cmd, { cwd: root, timeoutMs: VERIFY_TIMEOUT_MS, signal });
+  return { ok: r.ok, stdout: r.stdout, stderr: r.stderr, cmd, kind: r.kind, reason: r.reason, code: r.code };
 }
 
 function digest(text: string, max = ERROR_DIGEST): string {
-  const t = text.replace(/\x1b\[[0-9;]*m/g, "");
-  return t.length <= max ? t : t.slice(0, max) + "\n...(truncated)";
+  return truncateMiddle(stripAnsi(text), max);
 }
 
-/* ---- 主循环 ---- */
+const outputOf = (v: VerifyResult) => digest(`${v.stderr}\n${v.stdout}`.trim(), ERROR_DIGEST);
+
+/* =========================================================================
+ * 主流程
+ * ========================================================================= */
 
 export type FixOpts = {
   autoRetry?: boolean;
   requireConfirm?: boolean;
-  sessionId?: string,
-  model?:string
+  signal?: AbortSignal;
+  /** 失败时也保留 Agent 的改动（默认回滚）。也可用环境变量 AGENT_KEEP_ON_FAIL=1 */
+  keepOnFail?: boolean;
+  sessionId?: string;
+  model?: string;
+  /** 高风险写操作的交互确认；缺省 = 非交互（这类操作会被拒绝并告知模型） */
+  approve?: ApproveFn;
+  /** 本会话已授权的文件集合（跨多次任务共享） */
+  approved?: Set<string>;
 };
+
+/**
+ * fixed       验证器全部通过（且评审没有否决）
+ * unverified  改动已完成，但没有可用验证器（环境问题）——如实标注，不假装通过
+ * no_change   模型没有做任何文件改动（无需修改 / 无法修改）
+ * failed      多轮后仍未通过；已回滚（除非 keepOnFail）
+ * aborted     用户中断；改动保留，可用 /undo 撤销
+ */
+export type FixStatus = "fixed" | "unverified" | "no_change" | "failed" | "aborted";
+
 export type FixResult = {
-  status: "fixed" | "failed" | "denied";
+  status: FixStatus;
   attempts: number;
-  log: string
+  log: string;
+  changedFiles: string[];
+  rolledBack: boolean;
+  warnings: string[];
+  /** 保留着的检查点；上层可调用 workspace.rollback() 实现 /undo */
+  workspace: Workspace;
 };
 
-export async function runFixTask(
-  task: string,
-  root: string,
-  opts: FixOpts = {}
-): Promise<FixResult> {
-  const absRoot = path.resolve(root);
-  const { autoRetry = true} = opts;
-  const maxRetries = autoRetry ? MAX_RETRIES : 1;
+export async function runFixTask(task: string, rootDir: string, opts: FixOpts = {}): Promise<FixResult> {
+  const root = path.resolve(rootDir);
+  const { autoRetry = true, signal } = opts;
+  const model = opts.model ?? MODEL;
+  const sessionId = opts.sessionId ?? crypto.randomBytes(8).toString("hex");
+  const approved = opts.approved ?? new Set<string>();
+  const keepOnFail = opts.keepOnFail ?? process.env.AGENT_KEEP_ON_FAIL === "1";
+  const maxRetriesCfg = autoRetry ? MAX_RETRIES : 1;
 
-  try { await fs.access(absRoot, fs.constants.R_OK | fs.constants.W_OK); }
-  catch { throw new Error(`工作目录不可读写：${absRoot}`); }
-  
-  try { await execAsync("git rev-parse --git-dir", { cwd: absRoot }); }
-  catch {
-    throw new Error(`不是 git 仓库（无法建立检查点）：${absRoot}\n请先 git init 或 cd 到仓库根目录。`);
-  }
+  const ws = new Workspace(root);
+  const warnings: string[] = [];
+  const roundLogs: string[] = [];
+  let attempts = 0;
+  let gitBefore: Awaited<ReturnType<typeof gitInfo>> = { state: "not_repo" };
 
-  const manifest = await ensureManifest(absRoot);
-  const override = process.env.AGENT_VERIFY_CMD;
-  const cmds = override ? [override] : manifest.verifyCommands.length ? manifest.verifyCommands : [fallbackCmd(manifest.lang)];
+  const finish = async (status: FixStatus, extra?: string): Promise<FixResult> => {
+    const touched = await ws.changedFiles().catch(() => [] as string[]);
+    let rolledBack = false;
+    if (status === "failed" && !keepOnFail) {
+      await ws.rollback();
+      rolledBack = true;
+    }
+    // run_command 的副作用无法进 journal（也就无法回滚）——有 git 就尽力提醒，没有就算了
+    try {
+      const after = await gitInfo(root);
+      const side = await untrackedSideEffects(gitBefore, after, touched);
+      if (side.length) warnings.push(`run_command 可能产生了未纳入检查点、无法自动回滚的改动：${side.slice(0, 8).join(", ")}`);
+    } catch { /* 附加提示，失败就不提示 */ }
 
-  console.error(`[fix] cwd=${absRoot} lang=${manifest.lang} cmds=[${cmds.join(", ")}]`);
+    const log = [...roundLogs, extra, warnings.length ? `[warnings]\n- ${warnings.join("\n- ")}` : ""].filter(Boolean).join("\n");
+    return { status, attempts, log, changedFiles: rolledBack ? [] : touched, rolledBack, warnings, workspace: ws };
+  };
 
-  const checkpoint = await gitCheckpoint(absRoot, "before-fix");
-  const attemptLog: string[] = [];
-  let currentTask = task;
-
-  for (let attempt = 1; attempt <= maxRetries; attempt++) {
-    const ctx = await buildContext(absRoot);
-
-    // 1) 让模型产出结构化提案
-    const plan = await proposePlan(currentTask, ctx, absRoot, opts.model ?? "gpt-4o-mini");
-    const ops = plan.files.map((f) => classify(absRoot, currentTask, ctx, f));
-
-    // 2) 路径不确定 → 先纠错，不花 token 执行
-    const pathHints = ops.filter((f) => f.resolved.status === "candidate" || f.resolved.status === "notfound" || f.resolved.status === "outside");
-    if (pathHints.length && attempt < maxRetries) {
-      const feedback = pathHints.map((f) => `${f.path}: ${f.resolved.note}`).join("\n");
-      currentTask = `路径有误，请按以下提示修正后再改代码：\n${feedback}`;
-      attemptLog.push(`[guard] path hints: ${feedback}`);
-      continue;
+  try {
+    /* ---- 1. 环境探测：任何一步失败都降级，而不是崩溃 ---- */
+    let manifest: Manifest;
+    try {
+      manifest = await ensureManifest(root, model);
+    } catch (e: any) {
+      warnings.push(`项目探测失败（${e?.message ?? e}），将在没有预置验证器的情况下继续`);
+      manifest = { lang: "unknown", verifyCommands: [], probedAt: Date.now(), mtimes: {} };
     }
 
-    // 3) 分组：确定的自动，不确定的弹窗
-    const { auto, ask } = groupOps(ops);
-    for (const f of auto) {
-      await applyOp(absRoot, f);
-      console.error(`[✓] auto ${f.path} ${diffSummary(f)}`);
-    }
-    if (ask.length) {
-      ask.forEach((f) => console.error(`[${f.risk}] ${f.path} ← ${f.reason} | ${f.resolved.note}`));
-      const ok = autoAllowed() || (await confirmTerminal(ask));
-      if (!ok) {
-        attemptLog.push(`[denied] ${ask.map((f) => f.path).join(", ")}`);
-        await gitRollback(absRoot, checkpoint);
-        return { status: "denied", attempts: attempt, log: attemptLog.join("\n") };
-      }
-      for (const f of ask) await applyOp(absRoot, f);
+    gitBefore = await gitInfo(root);
+    if (gitBefore.state === "unavailable") {
+      warnings.push(`git 不可用（${gitBefore.detail}）：不影响修复与回滚——检查点由内置的文件日志负责，仅缺少 git 辅助信息`);
     }
 
-    // 4) 验证
-    let shellOk = true;
-    let lastError = "";
+    const override = process.env.AGENT_VERIFY_CMD;
+    let cmds = override ? [override] : [...manifest.verifyCommands];
+    for (const r of manifest.rejected ?? []) warnings.push(`验证命令已排除：${r.cmd}（${r.reason}）`);
+
+    /* ---- 2. 基线验证：在模型动手前拿到客观事实 ----
+     *   - 验证器本身跑不起来（env/timeout）→ 现在就剔除，别等到烧完重试次数才发现
+     *   - 验证器报代码错误 → 原文作为第一轮的证据直接喂给模型
+     */
+    let baselineEvidence = "";
+    const usable: string[] = [];
     for (const cmd of cmds) {
-      const v = await runVerify(absRoot, cmd);
-      attemptLog.push(`[${v.ok ? "PASS" : "FAIL"}] ${v.cmd}\n${digest(v.stdout + v.stderr, 2000)}`);
-      if (!v.ok) { shellOk = false; lastError = `[${v.cmd}]\n${digest(v.stdout + v.stderr, ERROR_DIGEST)}`; break; }
-    }
-    if (!shellOk) {
-      currentTask = `上一轮修改未通过验证，请根据以下错误原文重新修复：\n${lastError}`;
-      continue;
-    }
-
-    // 5) critic
-    const diff = await gitDiff(absRoot);
-    if (!shouldSkipCritic(diff)) {
-      const c = await runCritic({ task: currentTask, rubric: manifest.rubric ?? "", diff, lastShellOutput: "" });
-      attemptLog.push(`[critic] ${c.pass ? "PASS" : "FAIL"} score=${c.score} fatal=${c.fatal}\n${c.detail.slice(0, 600)}`);
-      if (!c.pass && c.fatal) {
-        currentTask = `评审发现严重问题，必须修复：${c.detail}`;
-        await gitRollback(absRoot, checkpoint);
+      if (signal?.aborted) return finish("aborted");
+      const v = await runVerify(root, cmd, signal);
+      if (!v.ok && v.kind !== "code") {
+        warnings.push(`验证器不可用：${cmd}（${v.reason}）`);
         continue;
       }
+      usable.push(cmd);
+      if (!v.ok) baselineEvidence += `\n[${cmd}]（退出码 ${v.code}）\n${outputOf(v)}\n`;
+    }
+    cmds = usable;
+
+    const verifiable = cmds.length > 0;
+    if (!verifiable) {
+      warnings.push("没有任何可用的验证器：本次修改只能由模型自检 + 评审把关，结果将标记为“未验证”");
+    }
+    const maxRetries = verifiable ? maxRetriesCfg : 1; // 无法验证时重试没有意义，没有新证据可喂
+    console.error(`[fix] lang=${manifest.lang} verifiers=[${cmds.join(", ") || "无"}] maxRetries=${maxRetries}`);
+
+    /* ---- 3. 主循环（同一会话持续，而不是每轮重建上下文） ---- */
+    let ctx = "";
+    try { ctx = await buildContext(root, model); } catch (e: any) { warnings.push(`构建上下文失败：${e?.message ?? e}`); }
+
+    let session: Msg[] | undefined;
+    let prompt = task + (baselineEvidence
+      ? `\n\n【修改前的真实验证输出（客观证据，请据此定位）】${baselineEvidence}`
+      : verifiable ? "\n\n（修改前验证命令全部通过。）" : "");
+
+    let lastFp = "";
+    let lastSig = "";
+    let lastFailure = "";
+
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+      attempts = attempt;
+      if (signal?.aborted) return finish("aborted");
+
+      const r = await runAgent(prompt, session ? "" : ctx, {
+        root, sessionId, model, mode: "agent", workspace: ws, signal, messages: session,
+        task, approve: opts.approve, approved,
+      });
+      session = r.messages;
+      const roundLog: string[] = [`--- attempt ${attempt} ---`, `agent: [${r.status}] steps=${r.steps} tools=${r.toolCalls} | ${r.text.slice(0, 200).replace(/\s+/g, " ")}`];
+      roundLogs.push(roundLog.join("\n"));
+
+      if (r.status === "aborted") return finish("aborted", "用户中断，已保留当前改动（可 /undo 撤销）");
+      if (r.status === "llm_error") {
+        // 模型都不可用了，不要在半成品上继续验证；让 finish 回滚
+        return finish("failed", `LLM 不可用，已停止：${r.text}`);
+      }
+
+      /* -- 验证：只有 kind=code 的失败才算"代码没改对" -- */
+      let failed: VerifyResult | null = null;
+      let passedCount = 0;
+      let lastOutput = "";
+      for (const cmd of [...cmds]) {
+        const v = await runVerify(root, cmd, signal);
+        const line = `[${v.ok ? "PASS" : v.kind === "code" ? "FAIL" : "INCONCLUSIVE"}] ${v.cmd}${v.ok ? "" : `（${v.reason}）`}`;
+        roundLogs.push(`${line}\n${v.ok ? "" : digest(`${v.stderr}\n${v.stdout}`.trim(), 2000)}`.trimEnd());
+        lastOutput = `${v.stderr}\n${v.stdout}`;
+        if (v.ok) { passedCount++; continue; }
+        if (v.kind === "code") { failed = v; break; }
+        // 验证器在本轮突然跑不起来了（超时 / 被删 / 环境变化）：既不能算过也不能算错
+        warnings.push(`验证器本轮不可用：${v.cmd}（${v.reason}）`);
+        cmds = cmds.filter((c) => c !== cmd);
+      }
+
+      if (failed) {
+        lastFailure = `[${failed.cmd}]\n${outputOf(failed)}`;
+        // 进展检测：改动指纹和报错都和上一轮一样 = 模型在原地打转，继续烧钱没有意义
+        const fp = await ws.fingerprint();
+        const sig = digest(`${failed.stderr}${failed.stdout}`, 400);
+        if (attempt > 1 && fp === lastFp && sig === lastSig) {
+          roundLogs.push("连续两轮改动与报错完全相同，判定无进展，提前终止");
+          break;
+        }
+        lastFp = fp; lastSig = sig;
+        prompt =
+          `上一轮修改未通过验证，请根据以下错误原文重新修复（只改相关行，不要注释或删除测试、不要吞错误）：\n${lastFailure}\n\n` +
+          `如果你判断这是环境问题而不是代码问题，请直接说明原因并停止修改。`;
+        continue;
+      }
+
+      /* -- 到这里：没有"代码层失败" -- */
+      const changed = await ws.changedFiles();
+      if (changed.length === 0) {
+        return finish("no_change", `模型未修改任何文件：${r.text.slice(0, 300)}`);
+      }
+
+      /* -- LLM 评审：只有否决权，不能单方面放行 -- */
+      const diff = await ws.diff();
+      if (!shouldSkipCritic(diff)) {
+        const c = await runCritic({ task, rubric: manifest.rubric ?? "", diff, lastShellOutput: lastOutput }, model);
+        roundLogs.push(`[critic] ${c.pass ? "PASS" : "FAIL"} score=${c.score} fatal=${c.fatal}\n${c.detail.slice(0, 600)}`);
+        if (!c.pass && c.fatal) {
+          lastFailure = `评审否决：${c.detail}`;
+          prompt = `评审发现严重问题，必须修复：${c.detail}\n请不要绕过检查，重新修改。`;
+          continue;
+        }
+      }
+
+      return finish(passedCount > 0 ? "fixed" : "unverified");
     }
 
-    console.error(attemptLog.join("\n"));
-    return { status: "fixed", attempts: attempt, log: attemptLog.join("\n") };
-  }
-
-  await gitRollback(absRoot, checkpoint);
-  return { status: "failed", attempts: maxRetries, log: attemptLog.join("\n") };
-}
-
-async function proposePlan(task: string, ctx: string, root: string, model:string): Promise<Proposal> {
-  const prompt =
-    `任务：${task}\n上下文：${ctx}\n\n` +
-    `输出严格 JSON：{"summary":"一句话","files":[{"path":"相对路径","action":"edit|create|delete","reason":"为什么必须改它","newContent":"完整新内容"}]}\n` +
-    `约束：只列真实存在的文件（新建除外）；path 相对于工作目录；不要列 .git/node_modules；edit 必须提供 newContent（完整文件内容）。`;
-  const resp = await client.chat.completions.create({
-    model: model,
-    messages: [{ role: "user", content: prompt }],
-    temperature: 0,
-    response_format: { type: "json_object" },
-  });
-  const obj = JSON.parse(resp.choices[0].message.content ?? "{}");
-  const files = (Array.isArray(obj.files) ? obj.files : []).map((f: any) => {
-    const r = resolvePath(root, f.path);
-    const before = r.abs ? safeRead(r.abs) : "";
-    return {
-      path: String(f.path),
-      action: (["edit", "create", "delete"].includes(f.action) ? f.action : "edit") as FileOp["action"],
-      before,
-      after: f.action === "delete" ? "" : (String(f.newContent ?? before)),
-      reason: String(f.reason ?? ""),
-    };
-  });
-  return { id: proposalId(), files, summary: String(obj.summary ?? "") };
-}
-
-async function applyOp(root: string, op: FileOp): Promise<void> {
-  const r = resolvePath(root, op.path);
-  if (op.action === "delete" && r.abs) {
-    await fs.unlink(r.abs);
-    console.error(`[audit] DELETE ${r.abs}`);
-    return;
-  }
-  if (op.action === "create" || op.action === "edit") {
-    await fs.mkdir(path.dirname(r.abs), { recursive: true });
-    await fs.writeFile(r.abs, op.after, "utf-8");
-    console.error(`[audit] WRITE ${r.abs}`);
-    return;
+    return finish("failed", lastFailure ? `最后一次失败：\n${lastFailure}` : undefined);
+  } catch (e: any) {
+    // 兜底：未预料的异常也要回滚，并且作为结果返回而不是抛给 REPL
+    roundLogs.push(`[内部错误] ${e?.stack ?? e}`);
+    return finish("failed", `内部错误：${e?.message ?? e}`);
   }
 }
-
-function safeRead(abs: string): Promise<string> {
-  return fs.readFile(abs, "utf-8").catch(() => "");
-}
-
-export { setAllowed, clearAllowed };

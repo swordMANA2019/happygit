@@ -33,12 +33,12 @@ fatal=true 当且仅当：删除或跳过测试、注释掉报错、新增 any/u
 
 export type CriticCtx = { task: string; rubric: string; diff: string; lastShellOutput: string };
 
-export async function runCritic(ctx: CriticCtx): Promise<CriticResult> {
+export async function runCritic(ctx: CriticCtx, model: string = MODEL): Promise<CriticResult> {
   const body = PROMPT + `\n任务：${ctx.task}\n验收：${ctx.rubric || "(无)"}\ndiff：${ctx.diff || "(无)"}\n验证输出：${ctx.lastShellOutput.slice(0, 3000)}`;
   for (let i = 0; i < 3; i++) {
     try {
       const resp = await client.chat.completions.create({
-        model: MODEL, messages: [{ role: "user", content: body }], temperature: 0,
+        model, messages: [{ role: "user", content: body }], temperature: 0,
         response_format: { type: "json_object" },
       });
       const r = parse(JSON.parse(resp.choices[0].message.content ?? "{}"));
@@ -49,6 +49,6 @@ export async function runCritic(ctx: CriticCtx): Promise<CriticResult> {
 }
 
 export function shouldSkipCritic(diff: string): boolean {
-  const lines = diff.split("\n").filter((l) => l.startsWith("+") || l.startsWith("-"));
+  const lines = diff.split("\n").filter((l) => (l.startsWith("+") || l.startsWith("-")) && !l.startsWith("+++") && !l.startsWith("---"));
   return lines.filter((l) => !/^[+-]\s*(\/\/|#|\/\*|\*|\s*$)/.test(l)).length < 5;
 }
