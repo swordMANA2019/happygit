@@ -20,11 +20,13 @@ type Branch = "agent" | "ask" | "fix" | "edit" | "diag";
 function printBanner(ses: Session) {
   console.log(`Mini Agent | 模型：${ses.model} | 目录：${ses.cwd} | session：${ses.sessionId}`);
   console.log("直接输入即可（Agent 模式：自行判断回答或修改）。命令：/ask <问题> 只读问答 | /fix <任务> | /edit <任务> | /diag <任务> | /undo");
-  console.log("      /plan 查看计划与笔记 | /resume 恢复上次对话 | /reset 清空对话 | /probe | /context | /cd <目录> | /pwd | /model <名> | /exit   （任务运行中 Ctrl+C 可中断）");
+  console.log("      /plan 计划与笔记 | /jobs 后台任务 | /skills 技能 | /mcp [reload] 外部工具 | /resume 恢复上次对话 | /reset 清空对话 | /probe | /context | /cd <目录> | /pwd | /model <名> | /exit   （任务运行中 Ctrl+C 可中断）");
 }
 
 function describe(res: FixResult): string {
-  const files = res.changedFiles.length ? `\n改动文件：\n  ${res.changedFiles.join("\n  ")}` : "";
+  const files =
+    (res.changedFiles.length ? `\n改动文件：\n  ${res.changedFiles.join("\n  ")}` : "") +
+    (res.produced.length ? `\n脚本产出/修改的文件（不在检查点里，/undo 无法还原）：\n  ${res.produced.slice(0, 20).join("\n  ")}` : "");
   const answer = res.answer ? `\n助手> ${res.answer}\n` : "";
   switch (res.status) {
     case "fixed":
@@ -135,7 +137,7 @@ async function main() {
 
   // CLI 单次调用：走和 REPL 同一条路径，保证有检查点/验证/回滚
   if (argTask) {
-    try { await handle(ses, argTask); } finally { rl?.close(); }
+    try { await handle(ses, argTask); } finally { rl?.close(); ses.dispose(); }
     return;
   }
 
@@ -146,6 +148,7 @@ async function main() {
     if (ses.interrupt()) {
       console.log("\n[中断] 正在停止当前任务…");
     } else {
+      ses.dispose();
       rl!.close();
       process.exit(0);
     }
@@ -168,6 +171,9 @@ async function main() {
       if (input === "/probe") { await ses.probe(); console.log(`已重新探测了 ${ses.cwd}`); continue; }
       if (input === "/reset") { await ses.resetHistory(); console.log("对话已清空"); continue; }
       if (input === "/plan") { console.log(ses.describeState()); continue; }
+      if (input === "/jobs") { console.log(ses.describeJobs()); continue; }
+      if (input === "/skills") { console.log(await ses.describeSkills()); continue; }
+      if (input === "/mcp" || input === "/mcp reload") { console.log(await ses.describeMcp(input.endsWith("reload"))); continue; }
       if (input === "/resume") {
         const n = await ses.resume();
         console.log(n ? `已恢复上次对话（${n} 条消息，${ses.turns} 轮提问）` : "没有可恢复的对话。");
@@ -198,6 +204,7 @@ async function main() {
       }
     }
   } finally {
+    ses.dispose();
     rl!.close();
   }
 }

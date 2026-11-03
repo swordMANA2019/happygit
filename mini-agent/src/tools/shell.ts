@@ -41,7 +41,7 @@ export function decodeOutput(chunks: Buffer[]): string {
   }
 }
 
-function killTree(pid: number | undefined) {
+export function killTree(pid: number | undefined) {
   if (!pid) return;
   try {
     if (process.platform === "win32") {

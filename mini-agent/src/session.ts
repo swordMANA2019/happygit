@@ -13,6 +13,9 @@ import { MODEL } from "./config.js";
 import {
   type Msg, addNote, compactConversation, saveConversation, loadConversation, clearConversation,
 } from "./memory.js";
+import { JobManager } from "./tools/jobs.js";
+import { McpManager } from "./mcp.js";
+import { discoverSkills, skillsBlock } from "./skills.js";
 import { type TaskState, emptyState, resetState, loadState, renderPlan } from "./taskstate.js";
 
 /** 向用户提问。signal 触发（Ctrl+C）时应返回 ""，调用方会把空答案当作"拒绝" */
@@ -31,6 +34,10 @@ export class Session {
   readonly messages: Msg[] = [];
   /** 计划 + 工作笔记：每一步都注入系统提示，不受历史压缩影响（见 taskstate.ts） */
   readonly state: TaskState = emptyState();
+  /** 后台任务（长时间命令）：会话级，跨回合存活，退出时统一终止 */
+  readonly jobs = new JobManager();
+  /** 外部工具（MCP）连接 */
+  readonly mcp = new McpManager();
   /** 最近一次"真正改过文件"的任务的检查点，供 /undo 使用 */
   lastWorkspace: Workspace | null = null;
   /** 用户选过 always 的文件 */
@@ -85,13 +92,24 @@ export class Session {
     }
   }
 
+  private askUser(signal: AbortSignal): ((q: string) => Promise<string>) | null {
+    const p = this.prompter;
+    return p ? (q) => p.ask(q, signal) : null;
+  }
+
   private approveFn(): ApproveFn | undefined {
     const p = this.prompter;
     if (!p) return undefined;
     return (ops) => confirmOps((q) => p.ask(q, this.controller?.signal), ops);
   }
 
-  context(): Promise<string> { return buildContext(this._cwd, this.model); }
+  /** 技能清单（+ 已连接的外部工具说明）：拼进系统提示 */
+  private async extraContext(withMcp: boolean): Promise<string> {
+    const skills = await discoverSkills(this._cwd).catch(() => []);
+    return [skillsBlock(skills), withMcp ? this.mcp.promptBlock() : ""].filter(Boolean).join("\n\n");
+  }
+
+  async context(): Promise<string> { return buildContext(this._cwd, this.model, await this.extraContext(false)); }
 
   /** 只读问答：工具集里没有写工具 */
   ask(input: string): Promise<AgentResult> {
@@ -99,7 +117,7 @@ export class Session {
       const ctx = await this.context();
       return runAgent(input, ctx, {
         root: this._cwd, sessionId: this.sessionId, model: this.model, mode: "ask", signal, task: input,
-        messages: this.messages, state: this.state,
+        messages: this.messages, state: this.state, jobs: this.jobs,
       });
     });
   }
@@ -109,9 +127,11 @@ export class Session {
    */
   fix(task: string, opts: FixOpts = {}): Promise<FixResult> {
     return this.run(async (signal) => {
+      await this.mcp.ensure(this._cwd, this.askUser(signal));
       const res = await runFixTask(task, this._cwd, {
         ...opts, signal, sessionId: this.sessionId, model: this.model,
         approve: this.approveFn(), approved: this.approved, messages: this.messages, state: this.state,
+        jobs: this.jobs, mcp: this.mcp, extraContext: await this.extraContext(true),
       });
 
       if (res.rolledBack) {
@@ -155,6 +175,33 @@ export class Session {
     this.messages.push(...saved.messages);
     loadState(this.state, saved.state);
     return saved.messages.length;
+  }
+
+  /** /skills */
+  async describeSkills(): Promise<string> {
+    const skills = await discoverSkills(this._cwd);
+    return skills.length
+      ? skills.map((s) => `- ${s.name}（${s.source}）：${s.description}${s.verify ? "  [带自动验证]" : ""}`).join("\n")
+      : "没有可用技能。把技能放到 .agent/skills/<名字>/SKILL.md 即可。";
+  }
+
+  /** /mcp：当前目录的外部工具连接状态；reload 重新读取配置 */
+  async describeMcp(reload = false): Promise<string> {
+    const ask = this.prompter ? (q: string) => this.prompter!.ask(q) : null;
+    if (reload) await this.mcp.reload(this._cwd, ask); else await this.mcp.ensure(this._cwd, ask);
+    return `${this.mcp.describe()}${this.mcp.toolCount ? `\n共 ${this.mcp.toolCount} 个外部工具` : ""}`;
+  }
+
+  /** /jobs */
+  describeJobs(): string {
+    const all = this.jobs.list();
+    return all.length ? all.map((j) => this.jobs.describe(j)).join("\n") : "没有后台任务。";
+  }
+
+  /** 退出前清理：终止后台任务、关闭外部工具进程 */
+  dispose() {
+    this.jobs.killAll();
+    this.mcp.closeAll();
   }
 
   /** 当前计划与笔记的可读文本（/plan 用） */

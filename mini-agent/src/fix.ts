@@ -12,6 +12,10 @@ import { Workspace, gitInfo, untrackedSideEffects } from "./workspace.js";
 import { stripAnsi, truncateMiddle } from "./util.js";
 import type { FailureKind } from "./errors.js";
 import type { TaskState } from "./taskstate.js";
+import type { JobManager } from "./tools/jobs.js";
+import type { McpManager } from "./mcp.js";
+import { snapshotTree, producedFiles } from "./snapshot.js";
+import { discoverSkills, skillVerifiers, type Skill } from "./skills.js";
 
 type Msg = OpenAI.Chat.Completions.ChatCompletionMessageParam;
 
@@ -70,6 +74,11 @@ export type FixOpts = {
    * 不开启则和以前一样：先跑基线、证据放进第一轮 prompt（/fix 用）。
    */
   deferBaseline?: boolean;
+  /** 后台任务管理器 / 外部工具（MCP）/ 技能清单等：由 Session 持有并传入 */
+  jobs?: JobManager;
+  mcp?: McpManager;
+  /** 拼进系统提示的额外段落（技能清单、MCP 说明） */
+  extraContext?: string;
 };
 
 /**
@@ -86,6 +95,8 @@ export type FixResult = {
   attempts: number;
   log: string;
   changedFiles: string[];
+  /** 由 run_command（脚本）产出或修改的文件：不在检查点里，/undo 还原不了，但值得告诉用户（如生成的 .pptx） */
+  produced: string[];
   rolledBack: boolean;
   warnings: string[];
   /** Agent 最后一次的文字回答（问答类回合里，这就是给用户的答案） */
@@ -108,6 +119,9 @@ export async function runFixTask(task: string, rootDir: string, opts: FixOpts = 
   const roundLogs: string[] = [];
   let attempts = 0;
   let lastAnswer = "";
+  let produced: string[] = [];
+  let hasDynamicVerifier = false;
+  const usedSkills = new Set<string>();
   let gitBefore: Awaited<ReturnType<typeof gitInfo>> = { state: "not_repo" };
 
   const finish = async (status: FixStatus, extra?: string): Promise<FixResult> => {
@@ -125,7 +139,7 @@ export async function runFixTask(task: string, rootDir: string, opts: FixOpts = 
     } catch { /* 附加提示，失败就不提示 */ }
 
     const log = [...roundLogs, extra, warnings.length ? `[warnings]\n- ${warnings.join("\n- ")}` : ""].filter(Boolean).join("\n");
-    return { status, attempts, log, changedFiles: rolledBack ? [] : touched, rolledBack, warnings, answer: lastAnswer || extra || "", workspace: ws };
+    return { status, attempts, log, changedFiles: rolledBack ? [] : touched, produced, rolledBack, warnings, answer: lastAnswer || extra || "", workspace: ws };
   };
 
   try {
@@ -175,11 +189,15 @@ export async function runFixTask(task: string, rootDir: string, opts: FixOpts = 
       return evidence;
     };
     // 无法验证时重试没有意义（没有新证据可喂）；延后基线时，这个值要等基线跑完才准确，所以每轮重算
-    const maxRetries = () => (cmds.length > 0 ? maxRetriesCfg : 1);
+    const maxRetries = () => (cmds.length > 0 || hasDynamicVerifier ? maxRetriesCfg : 1);
 
     /* ---- 3. 主循环（同一会话持续，而不是每轮重建上下文） ---- */
     let ctx = "";
-    try { ctx = await buildContext(root, model); } catch (e: any) { warnings.push(`构建上下文失败：${e?.message ?? e}`); }
+    try { ctx = await buildContext(root, model, opts.extraContext); } catch (e: any) { warnings.push(`构建上下文失败：${e?.message ?? e}`); }
+
+    // 任务前的目录快照：任务后对比，找出脚本（run_command）产出的文件；技能清单用于查找技能声明的验证器
+    const snapBefore = await snapshotTree(root);
+    const skills = await discoverSkills(root).catch(() => [] as Skill[]);
 
     // 历史由 Session 传入并原地追加；单独调用时用一个本地数组，同样能跨重试保持上下文
     const convo: Msg[] = opts.messages ?? [];
@@ -213,6 +231,7 @@ export async function runFixTask(task: string, rootDir: string, opts: FixOpts = 
       const r = await runAgent(prompt, ctx, {
         root, sessionId, model, mode: "agent", workspace: ws, signal, messages: convo,
         task, approve: opts.approve, approved, beforeWrite, state: opts.state,
+        jobs: opts.jobs, mcp: opts.mcp, usedSkills,
       });
       if (r.text) lastAnswer = r.text;
       const roundLog: string[] = [`--- attempt ${attempt} ---`, `agent: [${r.status}] steps=${r.steps} tools=${r.toolCalls} | ${r.text.slice(0, 200).replace(/\s+/g, " ")}`];
@@ -224,16 +243,26 @@ export async function runFixTask(task: string, rootDir: string, opts: FixOpts = 
         return finish("failed", `LLM 不可用，已停止：${r.text}`);
       }
 
-      /* -- 统一入口下的纯问答/分析回合：没改任何文件就不需要验证，答案本身就是结果 -- */
-      if (opts.deferBaseline && (await ws.changedFiles()).length === 0) {
+      /* -- 本回合到底产出了什么：检查点里的改动 + 脚本生成的文件 -- */
+      const changedNow = await ws.changedFiles();
+      produced = producedFiles(snapBefore, await snapshotTree(root), changedNow);
+
+      /* -- 统一入口下的纯问答/分析回合：没改/没产出任何文件就不需要验证，答案本身就是结果 -- */
+      if (opts.deferBaseline && changedNow.length === 0 && produced.length === 0) {
         return finish("no_change");
       }
+
+      /* -- 验证：项目自带的验证器 + 本任务用过的技能声明的验证器（针对产出的文件）。
+       *    只产出了文件（如脚本生成的 pptx）而没改代码时，跑项目测试没有意义，只跑技能验证器。 -- */
+      const dyn = await skillVerifiers(skills, usedSkills, [...changedNow, ...produced]);
+      if (dyn.length) hasDynamicVerifier = true;
+      const toRun = changedNow.length > 0 || !opts.deferBaseline ? [...cmds, ...dyn] : dyn;
 
       /* -- 验证：只有 kind=code 的失败才算"代码没改对" -- */
       let failed: VerifyResult | null = null;
       let passedCount = 0;
       let lastOutput = "";
-      for (const cmd of [...cmds]) {
+      for (const cmd of toRun) {
         const v = await runVerify(root, cmd, signal);
         const line = `[${v.ok ? "PASS" : v.kind === "code" ? "FAIL" : "INCONCLUSIVE"}] ${v.cmd}${v.ok ? "" : `（${v.reason}）`}`;
         roundLogs.push(`${line}\n${v.ok ? "" : digest(`${v.stderr}\n${v.stdout}`.trim(), 2000)}`.trimEnd());
@@ -262,8 +291,8 @@ export async function runFixTask(task: string, rootDir: string, opts: FixOpts = 
       }
 
       /* -- 到这里：没有"代码层失败" -- */
-      const changed = await ws.changedFiles();
-      if (changed.length === 0) {
+      const changed = changedNow;
+      if (changed.length === 0 && produced.length === 0) {
         return finish("no_change", `模型未修改任何文件：${r.text.slice(0, 300)}`);
       }
 

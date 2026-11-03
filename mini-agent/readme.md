@@ -18,6 +18,10 @@ mini-agent/
     ├── critic.ts       # LLM 评审（只有否决权）
     ├── memory.ts       # 会话记忆：连续 messages、悬空 tool_call 修复、LLM 摘要压缩、落盘/恢复
     ├── taskstate.ts    # 任务状态：计划 + 工作笔记（update_plan / save_notes），每步注入系统提示，不受历史压缩影响
+    ├── skills.ts       # 技能加载：SKILL.md（name/description/verify/verify_ext），渐进披露，use_skill 才读正文
+    ├── mcp.ts          # MCP 客户端（stdio JSON-RPC），工具超过 20 个时改用 mcp_search_tools + mcp_call
+    ├── runtime.ts      # 运行环境探测（Python 等），供技能占位符 {python} 使用
+    ├── snapshot.ts     # 目录快照：发现脚本产出的文件（pptx/xlsx/图片等），不在检查点里也能被验证和汇报
     ├── diagnose.ts     # 只读诊断（/diag）
     ├── context.ts      # 运行环境 / 验证器 / 项目规则（AGENTS.md 等）
     ├── ui/confirm.ts   # 变更确认 UI（统一走 Session 的 prompter，只有一个 readline）
@@ -25,6 +29,8 @@ mini-agent/
         ├── ctx.ts      # ToolCtx：每次工具调用携带 root / workspace / 审批函数
         ├── fs.ts       # read / write / edit / delete / list（每次写入：resolve → policy → journal → 写）
         ├── search.ts   # 代码搜索（跳过凭据文件）
+        ├── jobs.ts     # 长任务：前台等待 → 超时不杀而转后台 job；job_output / stop_job / list_jobs
+        ├── docs.ts     # read_document（docx/pptx/xlsx/pdf）与图片加载
         └── shell.ts    # 进程执行：永不抛异常、杀进程树、超时、GBK 解码、危险命令拦截
 
 架构：
@@ -66,6 +72,20 @@ mini-agent/
 - 凭据文件（.env、*.pem、id_rsa 等）默认不可读/不可写/不进搜索结果（AGENT_ALLOW_SECRETS=1 可关闭）。
 - 高风险写操作（删除、新建配置类文件、风险评分过低）需确认；非交互环境下会被拒绝而不是默认放行；
   --yes 或 AGENT_AUTO_APPROVE=1 可整体放行。
+
+长任务（pip install torch 之类）：
+- run_command 前台只等 timeout_ms（默认较短）；还没结束就【转入后台 job】，不杀进程，返回 job id，并明确告诉模型"这不是失败"。
+- 模型用 job_output(job_id, wait_ms=60000) 等待并看新增输出，直到"已完成"；stop_job 终止；/jobs 查看。
+- 轮询调用不计入重复/卡死检测；前台等待期间有心跳日志；退出时自动清理后台进程。
+- 命令明确很慢时可直接传 background=true。
+
+技能 / MCP / 文档：
+- 技能目录（后者覆盖前者）：内置 skills/、~/.mini-agent/skills、<项目>/.agent/skills、<项目>/.cursor/skills。/skills 查看。
+  系统提示只列 name+description，模型判断相关时调用 use_skill 读正文；技能可声明 verify 命令，在产出文件后自动校验。
+- MCP 配置（{"mcpServers": {...}}）：~/.mini-agent/mcp.json（可信）、<项目>/.agent/mcp.json、<项目>/.cursor/mcp.json
+  （项目级需用户确认，--yes 跳过）。/mcp [reload] 查看。
+- 子任务：delegate 起只读子 Agent（深度受限、最多并行 3 个），适合并行读多份资料。
+- 可选视觉检查：AGENT_VISION=1 时 view_image 可看渲染后的图片。其它环境变量：AGENT_MCP_TIMEOUT_MS、AGENT_MCP_START_TIMEOUT_MS。
 
 打包工具：
 # 装 bun（一次）

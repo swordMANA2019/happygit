@@ -28,9 +28,16 @@ const SUMMARIZE_AT = 0.5;
 /** 压缩时原样保留的最近"用户消息"条数（含其后的全部工具往返） */
 const KEEP_USER_TURNS = 2;
 
+/** 消息文本：多段内容（带图片）只取文字部分，图片用占位符，避免 base64 进入摘要/大小估算/落盘 */
+function textOfContent(c: unknown): string {
+  if (typeof c === "string") return c;
+  if (Array.isArray(c)) return c.map((p: any) => (p?.type === "text" ? String(p.text) : "[图片]")).join("\n");
+  return c ? JSON.stringify(c) : "";
+}
+
 function sizeOf(m: Msg): number {
   const c = (m as any).content;
-  let n = typeof c === "string" ? c.length : c ? JSON.stringify(c).length : 0;
+  let n = textOfContent(c).length;
   const tcs = (m as any).tool_calls;
   if (tcs) n += JSON.stringify(tcs).length;
   return n;
@@ -84,8 +91,7 @@ const SUMMARY_PROMPT = `你在为一个编程 Agent 压缩对话历史。下面�
 不要复述工具的原始长输出，不要编造记录里没有的事实。`;
 
 function render(m: Msg): string {
-  const c = (m as any).content;
-  const text = typeof c === "string" ? c : c ? JSON.stringify(c) : "";
+  const text = textOfContent((m as any).content);
   if (m.role === "user") return `用户：${text.slice(0, 3000)}`;
   if (m.role === "tool") return `[工具结果] ${text.slice(0, 600)}`;
   if (m.role === "assistant") {
@@ -145,7 +151,10 @@ export async function saveConversation(root: string, messages: Msg[], state?: Ta
   try {
     if (messages.length === 0) return;
     await fs.mkdir(path.join(root, ".agent"), { recursive: true });
-    await fs.writeFile(FILE(root), JSON.stringify({ savedAt: Date.now(), messages, state }));
+    // 图片的 base64 不落盘：恢复后改成占位文字
+    const slim = messages.map((m) =>
+      Array.isArray((m as any).content) ? ({ ...m, content: textOfContent((m as any).content) } as Msg) : m);
+    await fs.writeFile(FILE(root), JSON.stringify({ savedAt: Date.now(), messages: slim, state }));
   } catch { /* 持久化失败不应影响主流程 */ }
 }
 

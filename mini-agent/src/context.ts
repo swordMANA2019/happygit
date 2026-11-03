@@ -2,6 +2,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { ensureManifest } from "./probe.js";
 import { gitInfo } from "./workspace.js";
+import { detectPython } from "./runtime.js";
 
 /** 项目级规则文件（对应 Cursor 的 rules / AGENTS.md），按优先级取第一个存在的 */
 const RULE_FILES = ["AGENTS.md", ".cursorrules", "CLAUDE.md", ".agent/rules.md"];
@@ -20,6 +21,8 @@ async function loadRules(root: string): Promise<string> {
 async function envBlock(root: string): Promise<string> {
   const shell = process.platform === "win32" ? (process.env.ComSpec ?? "cmd.exe") : (process.env.SHELL ?? "/bin/sh");
   const g = await gitInfo(root);
+  const py = await detectPython();
+  const pyLine = py ? `Python：${py.cmd}（${py.version}）` : "Python：未检测到（需要 Python 的脚本/技能无法运行，请如实告知用户）";
   const gitLine =
     g.state === "repo"        ? `git：可用，分支 ${g.branch}，${g.dirty.length} 个未提交改动（仅供参考；不要用 git 改写仓库状态）` :
     g.state === "not_repo"    ? "git：已安装，但项目目录不是 git 仓库" :
@@ -28,12 +31,19 @@ async function envBlock(root: string): Promise<string> {
     "## 运行环境",
     `- 系统：${process.platform}/${process.arch}  Node ${process.version}`,
     `- shell：${shell}${process.platform === "win32" ? "（Windows：没有 ls/cat/grep，优先使用 list_files/read_file/search_code 工具）" : ""}`,
+    `- ${pyLine}`,
     `- 项目根：${root}`,
     `- ${gitLine}`,
   ].join("\n");
 }
 
-export async function buildContext(root: string, model?: string): Promise<string> {
+/** extra：技能清单、MCP 外部工具说明等由 Session 在运行时拼出的段落 */
+export async function buildContext(root: string, model?: string, extra = ""): Promise<string> {
+  const base = await buildBaseContext(root, model);
+  return extra.trim() ? `${base}\n\n${extra.trim()}` : base;
+}
+
+async function buildBaseContext(root: string, model?: string): Promise<string> {
   const m = await ensureManifest(root, model);
 
   const rejected = m.rejected?.length

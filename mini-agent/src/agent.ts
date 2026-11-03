@@ -1,10 +1,13 @@
 import OpenAI from "openai";
 import {
-  client, toolsFor, buildSystemPrompt, TOOLS, READ_TOOL_NAMES, WRITE_TOOL_NAMES, type AgentMode,
+  client, toolsFor, buildSystemPrompt, TOOLS, READ_TOOL_NAMES, WRITE_TOOL_NAMES, AGENT_ONLY_NAMES, type AgentMode,
 } from "./llm.js";
 import { readFile, writeFile, editFile, deleteFile, listFiles } from "./tools/fs.js";
 import { searchCode } from "./tools/search.js";
-import { runCommand } from "./tools/shell.js";
+import { JobManager, runCommandJob, jobOutput, stopJob, listJobs } from "./tools/jobs.js";
+import { readDocument, loadImage } from "./tools/docs.js";
+import { discoverSkills, loadSkillText } from "./skills.js";
+import { isMcpToolName, type McpManager } from "./mcp.js";
 import type { ToolCtx, ApproveFn } from "./tools/ctx.js";
 import {
   MAX_STEPS, TOOL_OUTPUT_CAP, LLM_MAX_RETRIES, LLM_TIMEOUT_MS, CONTEXT_CHAR_BUDGET,
@@ -58,7 +61,28 @@ export type AgentOpts = {
   beforeWrite?: () => Promise<string | void>;
   /** 计划与笔记（由 Session 持有，跨回合保留）；不传则只在本次调用内有效 */
   state?: TaskState;
+  /** 后台任务管理器（Session 持有，跨回合保留）；不传则用进程级的共享实例 */
+  jobs?: JobManager;
+  /** 外部工具（MCP）；仅 agent 模式生效 */
+  mcp?: McpManager;
+  /** 本次任务用过的技能会被记在这里（fix 用它决定要跑哪些技能声明的验证） */
+  usedSkills?: Set<string>;
+  /** 子 Agent：只读、不能再 delegate、不向终端打印过程 */
+  sub?: boolean;
 };
+
+let sharedJobs: JobManager | null = null;
+const defaultJobs = () => (sharedJobs ??= new JobManager());
+
+/** 同时运行的子 Agent 数量上限（防止一次 10 个 delegate 把接口限流） */
+const MAX_PARALLEL_SUBAGENTS = 3;
+let activeSubs = 0;
+const subQueue: Array<() => void> = [];
+async function withSubSlot<T>(fn: () => Promise<T>): Promise<T> {
+  if (activeSubs >= MAX_PARALLEL_SUBAGENTS) await new Promise<void>((r) => subQueue.push(r));
+  activeSubs++;
+  try { return await fn(); } finally { activeSubs--; subQueue.shift()?.(); }
+}
 
 /* =========================================================================
  * 工具分发：永不抛异常，任何失败都变成"观察"文本回给模型
@@ -66,6 +90,11 @@ export type AgentOpts = {
 
 const READ_SET = new Set<string>(READ_TOOL_NAMES);
 const WRITE_SET = new Set<string>(WRITE_TOOL_NAMES);
+const AGENT_ONLY_SET = new Set<string>(AGENT_ONLY_NAMES);
+/** 互不依赖、可以同一轮并发执行的调用：纯读 + 子 Agent */
+const PARALLEL_SET = new Set<string>([...READ_TOOL_NAMES, "delegate"]);
+/** 轮询类调用：合法地反复出现，不参与"原地打转"检测 */
+const POLLING_SET = new Set<string>(["job_output", "list_jobs"]);
 
 function validateArgs(name: string, args: any): string | null {
   const def = TOOLS.find((t) => (t as any).function.name === name) as any;
@@ -97,8 +126,8 @@ function explainFsError(name: string, args: any, e: any): string {
 }
 
 async function dispatch(name: string, args: any, ctx: ToolCtx): Promise<string> {
-  if (ctx.mode === "ask" && WRITE_SET.has(name)) {
-    return "[已拒绝] 当前为只读模式，没有写文件权限。";
+  if (ctx.mode === "ask" && (WRITE_SET.has(name) || AGENT_ONLY_SET.has(name) || isMcpToolName(name))) {
+    return "[已拒绝] 当前为只读模式，没有写文件/执行命令/调用外部工具的权限。";
   }
   const bad = validateArgs(name, args);
   if (bad) return `[参数错误] ${name}：${bad}。请按工具 schema 重新调用。`;
@@ -117,17 +146,47 @@ async function dispatch(name: string, args: any, ctx: ToolCtx): Promise<string> 
       case "delete_file": return withNote(await deleteFile(ctx, args.path));
       case "update_plan": {
         const out = updatePlan(ctx.state, args);
-        console.log(`\n📋 ${out}`);
+        if (ctx.depth === 0) console.log(`\n📋 ${out}`);
         return out;
       }
       case "save_notes":  return saveNotes(ctx.state, args);
       case "list_files":  return await listFiles(ctx, args.path ?? ".", args.depth ?? 3);
       case "search_code": return await searchCode(ctx.root, args.query, args.max_results ?? 40);
+      case "read_document": return await readDocument(ctx, args.path, args.start_page, args.end_page);
+      case "view_image":  return await loadImage(ctx, args.path);
+      case "use_skill": {
+        const { text, skill } = await loadSkillText(await discoverSkills(ctx.root), args.name);
+        if (skill) ctx.usedSkills.add(skill.name);
+        return text;
+      }
       case "run_command": {
         const cwd = resolveCwd(ctx.root, args.cwd);
-        return await runCommand(args.command, { cwd, timeoutMs: args.timeout_ms, signal: ctx.signal });
+        return await runCommandJob(ctx.jobs, args.command, {
+          cwd, timeoutMs: args.timeout_ms, background: args.background === true, signal: ctx.signal,
+        });
+      }
+      case "job_output":  return await jobOutput(ctx.jobs, args.job_id, args.wait_ms, ctx.signal);
+      case "stop_job":    return stopJob(ctx.jobs, args.job_id);
+      case "list_jobs":   return listJobs(ctx.jobs);
+      case "delegate": {
+        if (ctx.depth > 0) return "[已拒绝] 子 Agent 不能再创建子 Agent，请自己直接完成。";
+        const task = String(args.task);
+        return await withSubSlot(async () => {
+          console.log(`\n🔀 子任务开始：${preview(task.replace(/\s+/g, " "), 120)}`);
+          const r = await runAgent(task, `## 运行环境\n- 项目根：${ctx.root}`, {
+            root: ctx.root, sessionId: ctx.sessionId, model: ctx.model, mode: "ask", sub: true,
+            maxSteps: 20, signal: ctx.signal, jobs: ctx.jobs,
+          });
+          console.log(`🔀 子任务结束（${r.status}，${r.steps} 步）`);
+          return truncateMiddle(r.status === "done" ? r.text : `[子任务未完成：${r.status}] ${r.text}`, 8000);
+        });
       }
       default:
+        if (ctx.mcp && isMcpToolName(name)) {
+          if (name === "mcp_search_tools") return ctx.mcp.search(args.query);
+          if (name === "mcp_call") return await ctx.mcp.call(String(args.name), args.arguments, ctx.signal);
+          return await ctx.mcp.call(name, args, ctx.signal);
+        }
         return `[未知工具] ${name}。可用工具：${TOOLS.map((t) => (t as any).function.name).join(", ")}`;
     }
   } catch (e: any) {
@@ -143,7 +202,10 @@ async function dispatch(name: string, args: any, ctx: ToolCtx): Promise<string> 
 
 function msgSize(m: Msg): number {
   const c = (m as any).content;
-  let n = typeof c === "string" ? c.length : c ? JSON.stringify(c).length : 0;
+  // 带图片的消息：base64 本身不计入字符预算，按固定开销估算
+  let n = typeof c === "string" ? c.length
+    : Array.isArray(c) ? c.reduce((s: number, p: any) => s + (p?.type === "text" ? String(p.text).length : 1500), 0)
+    : c ? JSON.stringify(c).length : 0;
   const tcs = (m as any).tool_calls;
   if (tcs) n += JSON.stringify(tcs).length;
   return n;
@@ -207,14 +269,14 @@ async function abortableSleep(ms: number, signal?: AbortSignal) {
   ]);
 }
 
-async function callLLM(messages: Msg[], mode: AgentMode, model: string, signal?: AbortSignal): Promise<LlmOutcome> {
+async function callLLM(messages: Msg[], tools: OpenAI.Chat.Completions.ChatCompletionTool[], model: string, signal?: AbortSignal): Promise<LlmOutcome> {
   let overflowHandled = false;
 
   for (let attempt = 0; ; attempt++) {
     if (signal?.aborted) return { ok: false, error: "已中断", aborted: true };
     try {
       const resp = await client.chat.completions.create(
-        { model, messages, tools: toolsFor(mode), tool_choice: "auto", temperature: 0 },
+        { model, messages, tools, tool_choice: "auto", temperature: 0 },
         { signal, timeout: LLM_TIMEOUT_MS },
       );
       if (!resp.choices?.[0]?.message) throw Object.assign(new Error("模型返回了空 choices"), { status: 502 });
@@ -280,7 +342,15 @@ export async function runAgent(userContent: string, context: string, opts: Agent
     signal,
     beforeWrite: opts.beforeWrite,
     state,
+    model: opts.model,
+    jobs: opts.jobs ?? defaultJobs(),
+    mcp: opts.mcp,
+    usedSkills: opts.usedSkills ?? new Set<string>(),
+    pendingImages: [],
+    depth: opts.sub ? 1 : 0,
   };
+  const log: (...a: any[]) => void = opts.sub ? () => {} : console.log;
+  const tools = toolsFor(mode, { extra: mode === "agent" ? opts.mcp?.toolDefs() : undefined, sub: opts.sub });
 
   let step = 0;
   let toolCalls = 0;
@@ -298,7 +368,7 @@ export async function runAgent(userContent: string, context: string, opts: Agent
 
       compactMessages(messages);
       if (messages[0]?.role === "system") messages[0] = makeSys();
-      const out = await callLLM(messages, mode, opts.model, signal);
+      const out = await callLLM(messages, tools, opts.model, signal);
       if (!out.ok) return result(out.aborted ? "aborted" : "llm_error", out.error);
 
       const choice = out.resp.choices[0];
@@ -321,7 +391,7 @@ export async function runAgent(userContent: string, context: string, opts: Agent
       }
 
       /* ---- thought：模型在调用工具前的自述 ---- */
-      if (msg.content?.trim()) console.log(`\n💭 ${preview(msg.content.trim(), 300)}`);
+      if (msg.content?.trim()) log(`\n💭 ${preview(msg.content.trim(), 300)}`);
 
       /* ---- action + observation ---- */
       const runOne = async (tc: any): Promise<string> => {
@@ -331,15 +401,16 @@ export async function runAgent(userContent: string, context: string, opts: Agent
           args = JSON.parse(tc.function.arguments || "{}");
         } catch {
           // 解析失败不能静默变成 {} 再用 undefined 参数执行工具：明确告诉模型，常见原因是输出被截断
-          console.log(`\n[步骤 ${step}] ${fn} (参数 JSON 非法)`);
+          log(`\n[步骤 ${step}] ${fn} (参数 JSON 非法)`);
           return `[参数错误] ${fn} 的 arguments 不是合法 JSON（可能因输出过长被截断）。请缩小单次修改范围后重新调用。`;
         }
-        console.log(`\n[步骤 ${step}] ${fn} ${preview(JSON.stringify(args), 160)}`);
+        log(`\n[步骤 ${step}] ${fn} ${preview(JSON.stringify(args), 160)}`);
 
-        // 重复检测：同一调用（run_command 以"期间是否有过写入"区分）反复出现 = 在原地打转
+        // 重复检测：同一调用（run_command 以"期间是否有过写入"区分）反复出现 = 在原地打转。
+        // 轮询后台任务本来就要反复调用同一个 job_output，不算原地打转
         const key = `${fn}:${JSON.stringify(args)}${fn === "run_command" ? `#w${writes}` : ""}`;
-        const n = (seen.get(key) ?? 0) + 1;
-        seen.set(key, n);
+        const n = POLLING_SET.has(fn) ? 0 : (seen.get(key) ?? 0) + 1;
+        if (!POLLING_SET.has(fn)) seen.set(key, n);
 
         let res = await dispatch(fn, args, ctx);
         if (WRITE_SET.has(fn) && res.startsWith("已")) writes++;
@@ -347,7 +418,7 @@ export async function runAgent(userContent: string, context: string, opts: Agent
         return res;
       };
 
-      const batch = calls.every((tc) => READ_SET.has(tc.function.name));
+      const batch = calls.every((tc) => PARALLEL_SET.has(tc.function.name));
       const results: string[] = new Array(calls.length);
       if (batch) {
         // 纯读操作互不依赖，并发执行
@@ -363,10 +434,27 @@ export async function runAgent(userContent: string, context: string, opts: Agent
       calls.forEach((tc, i) => {
         toolCalls++;
         const r = results[i];
-        console.log(preview(r, 300));
+        log(preview(r, 300));
         messages.push({ role: "tool", tool_call_id: tc.id, content: truncateMiddle(r, TOOL_OUTPUT_CAP) });
         if ([...seen.values()].some((v) => v >= 5)) stuck = true;
       });
+
+      // view_image：图片不能放进 tool 消息，只能作为紧随其后的一条 user 消息；旧图片换成占位文字，避免上下文被图片占满
+      if (ctx.pendingImages.length) {
+        for (const m of messages) {
+          if (m.role === "user" && Array.isArray(m.content) && m.content.some((p: any) => p?.type === "image_url")) {
+            (m as any).content = "[较早的图片已省略]";
+          }
+        }
+        messages.push({
+          role: "user",
+          content: [
+            { type: "text", text: `[系统] 你刚才请求查看的图片：${ctx.pendingImages.map((i) => i.path).join(", ")}` },
+            ...ctx.pendingImages.map((i) => ({ type: "image_url" as const, image_url: { url: i.dataUrl } })),
+          ],
+        });
+        ctx.pendingImages.length = 0;
+      }
       if (stuck) return result("stuck", "Agent 反复执行相同操作且没有进展，已强制终止。请换一种描述或拆分任务。");
     }
     step = maxSteps;

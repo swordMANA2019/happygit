@@ -3,6 +3,8 @@ import type { FileOp } from "../policy.js";
 import type { Approval } from "../ui/confirm.js";
 import type { AgentMode } from "../llm.js";
 import type { TaskState } from "../taskstate.js";
+import type { JobManager } from "./jobs.js";
+import type { McpManager } from "../mcp.js";
 
 export type ApproveFn = (ops: FileOp[]) => Promise<Approval>;
 
@@ -25,6 +27,18 @@ export type ToolCtx = {
   signal?: AbortSignal;
   /** 计划与工作笔记（update_plan / save_notes 读写它） */
   state: TaskState;
+  /** 当前模型（子 Agent 沿用） */
+  model: string;
+  /** 后台任务（长命令）管理器：会话级，跨回合保留 */
+  jobs: JobManager;
+  /** 外部工具（MCP）；没有配置则为空 */
+  mcp?: McpManager;
+  /** 本次任务中加载过的技能（用于完成后执行技能声明的验证） */
+  usedSkills: Set<string>;
+  /** view_image 排队等待附加到下一条消息的图片 */
+  pendingImages: Array<{ path: string; dataUrl: string }>;
+  /** 子 Agent 深度：>0 时不能再 delegate；输出静默 */
+  depth: number;
   /**
    * 第一次真正写文件之前调用（文件此刻仍是原样）。返回的文本会附在这次写入的结果后面回给模型。
    * 用来把"修改前基线验证"延后到确实要改代码时才做：纯问答/分析的对话不会白跑一遍测试。
