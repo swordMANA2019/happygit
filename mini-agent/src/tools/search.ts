@@ -12,6 +12,26 @@ export async function searchCode(root: string, query: string, maxResults = 40) {
   const hits: string[] = [];
   let skipped = 0;
 
+  async function searchContent(full: string) {
+    if (!TEXT_EXT.has(path.extname(full))) return;
+    let text: string;
+    try {
+      const st = await fs.stat(full);
+      if (st.size > MAX_FILE_BYTES) { skipped++; return; }
+      text = await fs.readFile(full, "utf8");
+    } catch {
+      skipped++;
+      return;
+    }
+    const lines = text.split(/\r?\n/);
+    for (let i = 0; i < lines.length; i++) {
+      if (re.test(lines[i])) {
+        hits.push(`${path.relative(root, full)}:${i + 1}: ${lines[i].trim().slice(0, 200)}`);
+        if (hits.length >= maxResults) break;
+      }
+    }
+  }
+
   async function walk(dir: string) {
     if (hits.length >= maxResults) return;
     let entries;
@@ -27,24 +47,15 @@ export async function searchCode(root: string, query: string, maxResults = 40) {
       const full = path.join(dir, e.name);
       if (e.isDirectory()) {
         await walk(full);
-      } else if (TEXT_EXT.has(path.extname(e.name)) && !isSensitivePath(path.relative(root, full))) {
-        let text: string;
-        try {
-          const st = await fs.stat(full);
-          if (st.size > MAX_FILE_BYTES) { skipped++; continue; }
-          text = await fs.readFile(full, "utf8");
-        } catch {
-          skipped++;
-          continue;
-        }
-        const lines = text.split(/\r?\n/);
-        for (let i = 0; i < lines.length; i++) {
-          if (re.test(lines[i])) {
-            hits.push(`${path.relative(root, full)}:${i + 1}: ${lines[i].trim().slice(0, 200)}`);
-            if (hits.length >= maxResults) break;
-          }
-        }
+        continue;
       }
+      if (isSensitivePath(path.relative(root, full))) continue;
+      // 文件名匹配：用户常按文件名（如 mlp.py）定位文件，内容里不一定出现这个字符串
+      if (re.test(e.name)) {
+        hits.push(`${path.relative(root, full)}: (文件名匹配)`);
+        if (hits.length >= maxResults) return;
+      }
+      await searchContent(full);
     }
   }
 

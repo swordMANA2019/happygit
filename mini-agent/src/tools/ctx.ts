@@ -22,4 +22,9 @@ export type ToolCtx = {
   /** 本会话已授权的文件（用户选了 always） */
   approved: Set<string>;
   signal?: AbortSignal;
+  /**
+   * 第一次真正写文件之前调用（文件此刻仍是原样）。返回的文本会附在这次写入的结果后面回给模型。
+   * 用来把"修改前基线验证"延后到确实要改代码时才做：纯问答/分析的对话不会白跑一遍测试。
+   */
+  beforeWrite?: () => Promise<string | void>;
 };

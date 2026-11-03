@@ -13,6 +13,7 @@ import { classifyLlmError } from "./errors.js";
 import { sleep, truncateMiddle } from "./util.js";
 import { Workspace } from "./workspace.js";
 import { resolveCwd } from "./guard.js";
+import { repairMessages } from "./memory.js";
 
 type Msg = OpenAI.Chat.Completions.ChatCompletionMessageParam;
 
@@ -46,13 +47,14 @@ export type AgentOpts = {
   mode?: AgentMode;
   maxSteps?: number;
   signal?: AbortSignal;
-  /** 传入上一次的 messages 则继续同一会话（不再重建 system/context） */
+  /** 会话历史（会被原地追加）。不传则新开一个会话；system 消息每回合都会按当前 mode 刷新 */
   messages?: Msg[];
   workspace?: Workspace;
   /** 原始任务描述（风险评分用），默认取 userContent */
   task?: string;
   approve?: ApproveFn;
   approved?: Set<string>;
+  beforeWrite?: () => Promise<string | void>;
 };
 
 /* =========================================================================
@@ -99,11 +101,17 @@ async function dispatch(name: string, args: any, ctx: ToolCtx): Promise<string> 
   if (bad) return `[参数错误] ${name}：${bad}。请按工具 schema 重新调用。`;
 
   try {
+    // 第一次写入前的钩子（基线验证）；钩子自己保证只执行一次，且失败不能阻止写入
+    let note = "";
+    if (WRITE_SET.has(name) && ctx.beforeWrite) {
+      try { note = (await ctx.beforeWrite()) || ""; } catch { /* 附加信息，失败就没有 */ }
+    }
+    const withNote = (s: string) => (note ? `${s}\n\n${note}` : s);
     switch (name) {
       case "read_file":   return await readFile(ctx, args.path, args.start_line, args.end_line);
-      case "write_file":  return await writeFile(ctx, args.path, args.content);
-      case "edit_file":   return await editFile(ctx, args.path, args.old_text, args.new_text);
-      case "delete_file": return await deleteFile(ctx, args.path);
+      case "write_file":  return withNote(await writeFile(ctx, args.path, args.content));
+      case "edit_file":   return withNote(await editFile(ctx, args.path, args.old_text, args.new_text));
+      case "delete_file": return withNote(await deleteFile(ctx, args.path));
       case "list_files":  return await listFiles(ctx, args.path ?? ".", args.depth ?? 3);
       case "search_code": return await searchCode(ctx.root, args.query, args.max_results ?? 40);
       case "run_command": {
@@ -234,10 +242,17 @@ export async function runAgent(userContent: string, context: string, opts: Agent
   const maxSteps = opts.maxSteps ?? MAX_STEPS;
   const signal = opts.signal;
 
-  const messages: Msg[] = opts.messages ?? [
-    { role: "system", content: buildSystemPrompt(mode) },
-  ];
-  messages.push({ role: "user", content: opts.messages || !context ? userContent : `${context}\n\n任务：${userContent}` });
+  // 会话历史由调用方（Session）持有并原地追加：同一个数组贯穿 ask / diag / fix 所有回合，
+  // 模型每次都看到完整的"用户说了什么 → 我调了什么工具 → 看到了什么 → 我回答了什么"。
+  const messages: Msg[] = opts.messages ?? [];
+
+  // 系统提示词每回合按当前模式重建（ask/agent 的工具集与规则不同），运行环境/验证器/项目规则放在系统提示里：
+  // 它们不属于"对话"，所以不会被历史压缩吞掉，也不会过期（每回合刷新）。
+  const sys: Msg = { role: "system", content: buildSystemPrompt(mode) + (context ? `\n\n${context}` : "") };
+  if (messages[0]?.role === "system") messages[0] = sys; else messages.unshift(sys);
+
+  repairMessages(messages);
+  messages.push({ role: "user", content: userContent });
 
   const ws = opts.workspace ?? new Workspace(opts.root);
   const ctx: ToolCtx = {
@@ -249,6 +264,7 @@ export async function runAgent(userContent: string, context: string, opts: Agent
     approve: opts.approve,
     approved: opts.approved ?? new Set<string>(),
     signal,
+    beforeWrite: opts.beforeWrite,
   };
 
   let step = 0;

@@ -16,8 +16,8 @@ mini-agent/
     ├── errors.ts       # 失败分类：env（环境）/ timeout / code（代码）；LLM 错误分类
     ├── probe.ts        # 探测语言与可用验证器（结果缓存在 .agent/manifest.json）
     ├── critic.ts       # LLM 评审（只有否决权）
-    ├── router.ts       # 意图路由 ask / edit / fix / clarify
-    ├── diagnose.ts     # 只读诊断
+    ├── memory.ts       # 会话记忆：连续 messages、悬空 tool_call 修复、LLM 摘要压缩、落盘/恢复
+    ├── diagnose.ts     # 只读诊断（/diag）
     ├── context.ts      # 运行环境 / 验证器 / 项目规则（AGENTS.md 等）
     ├── ui/confirm.ts   # 变更确认 UI（统一走 Session 的 prompter，只有一个 readline）
     └── tools/
@@ -28,9 +28,12 @@ mini-agent/
 
 架构：
 ┌─ CLI (index.ts) ─────────────────────────────────────────────────┐
-│  自然语言 / /fix / /edit / /ask / /diag  → Session.route()        │
-│   ask  ──→ runAgent(mode:"ask")   只读工具集，写工具根本不可见    │
-│   edit/fix ──→ runFixTask         闭环                            │
+│  没有意图路由器：用户选模式，模型自己理解请求                     │
+│   默认 ──→ runFixTask(deferBaseline)  模型自判回答/分析/修改；    │
+│            改了文件才进验证闭环，没改就只是一次问答               │
+│   /ask ──→ runAgent(mode:"ask")   只读工具集，写工具根本不可见    │
+│   /fix /edit /diag                用户显式指定的流程              │
+│   所有回合共用 Session.messages（连续对话，见 memory.ts）         │
 │   /undo ──→ 按 journal 精确还原上一次任务改过的文件               │
 └───────────────────────┬──────────────────────────────────────────┘
                         │

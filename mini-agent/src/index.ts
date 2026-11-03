@@ -2,37 +2,44 @@ import readline from "node:readline/promises";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { stdin, stdout } from "node:process";
-import { type Mode } from "./router.js";
 import { MODEL } from "./config.js";
 import { Session, type Prompter } from "./session.js";
 import type { FixResult, FixOpts } from "./fix.js";
 
-/** diag 是本地流程分支，不属于意图分类 */
-type Branch = Mode | "diag";
+/**
+ * 没有"意图路由器"：不再由一个分类器（LLM 或关键字）先替用户决定这句话是问答还是修改。
+ * 和 Cursor 一样，由用户选模式、由模型自己理解请求：
+ *   默认（Agent） —— 完整工具集，模型自己判断是回答、分析还是改代码；改了文件才进验证闭环
+ *   /ask         —— 只读工具集，写工具根本不可见
+ *   /fix /edit /diag —— 用户显式指定的流程
+ */
+type Branch = "agent" | "ask" | "fix" | "edit" | "diag";
 
 /* ---- 展示 ---- */
 
 function printBanner(ses: Session) {
   console.log(`Mini Agent | 模型：${ses.model} | 目录：${ses.cwd} | session：${ses.sessionId}`);
-  console.log("命令：/fix <任务> | /edit <任务> | /ask <问题> | /diag <任务> | /undo | /probe | /context");
-  console.log("      /cd <目录> | /pwd | /model <名> | /reset | /exit      （任务运行中 Ctrl+C 可中断）");
+  console.log("直接输入即可（Agent 模式：自行判断回答或修改）。命令：/ask <问题> 只读问答 | /fix <任务> | /edit <任务> | /diag <任务> | /undo");
+  console.log("      /resume 恢复上次对话 | /reset 清空对话 | /probe | /context | /cd <目录> | /pwd | /model <名> | /exit   （任务运行中 Ctrl+C 可中断）");
 }
 
 function describe(res: FixResult): string {
   const files = res.changedFiles.length ? `\n改动文件：\n  ${res.changedFiles.join("\n  ")}` : "";
+  const answer = res.answer ? `\n助手> ${res.answer}\n` : "";
   switch (res.status) {
     case "fixed":
-      return `\n✅ 修复成功（${res.attempts} 轮，验证通过）${files}\n（不满意可输入 /undo 撤销）\n${res.log}`;
+      return `${answer}\n✅ 修改完成（${res.attempts} 轮，验证通过）${files}\n（不满意可输入 /undo 撤销）\n${res.log}`;
     case "unverified":
-      return `\n⚠️  已完成修改，但【未能自动验证】（详见 warnings）${files}\n（可输入 /undo 撤销）\n${res.log}`;
+      return `${answer}\n⚠️  已完成修改，但【未能自动验证】（详见 warnings）${files}\n（可输入 /undo 撤销）\n${res.log}`;
     case "no_change":
-      return `\nℹ️  模型没有修改任何文件\n${res.log}`;
+      // 最常见的是纯问答/分析回合：答案就是结果，不需要任何"没有修改"的噪音
+      return `${answer}${res.warnings.length ? `\n[warnings]\n- ${res.warnings.join("\n- ")}` : ""}`;
     case "aborted":
-      return `\n⏹  已中断，当前改动已保留${files}\n（输入 /undo 可撤销）\n${res.log}`;
+      return `${answer}\n⏹  已中断，当前改动已保留${files}\n（输入 /undo 可撤销）\n${res.log}`;
     case "failed":
       return res.rolledBack
-        ? `\n❌ 修复失败，所有改动已回滚到修复前状态\n${res.log}`
-        : `\n❌ 修复失败，改动已按配置保留${files}\n${res.log}`;
+        ? `${answer}\n❌ 任务失败，所有改动已回滚到修改前状态\n${res.log}`
+        : `${answer}\n❌ 任务失败，改动已按配置保留${files}\n${res.log}`;
   }
 }
 
@@ -73,37 +80,36 @@ async function handle(ses: Session, input: string): Promise<void> {
   else if (input.startsWith("/ask ")) { forced = "ask"; body = input.slice(5).trim(); }
   else if (input.startsWith("/diag ")) { forced = "diag"; body = input.slice(6).trim(); }
 
-  // 显式命令跳过 LLM 路由；路由本身失败会在 router 内降级，不会抛
-  const r = forced
-    ? { mode: forced as Mode, reason: "(forced)", missing: [] as string[] }
-    : await ses.route(input);
-  const branch: Branch = forced ?? r.mode;
-  console.error(`[router] ${branch} | ${r.reason}`);
-
-  if (r.mode === "clarify" && !forced) {
-    console.log(`\n我需要先确认几点：\n${r.missing.map((m, i) => `${i + 1}. ${m}`).join("\n")}\n\n补充后重发，或 /fix 强制进入修复模式。`);
-    return;
-  }
+  // 没有路由：显式命令走对应流程，其余一律交给 Agent 自己理解
+  const branch: Branch = forced ?? "agent";
+  console.error(`[mode] ${branch}`);
 
   /* ---- ask：只读工具集，写工具根本不可见 ---- */
   if (branch === "ask") {
-    const out = await ses.ask(input);
+    const out = await ses.ask(body);
     console.log(`\n助手> ${out.status === "done" ? "" : `[${out.status}] `}${out.text}`);
     return;
   }
 
-  /* ---- diag：只读诊断 → 出报告 → 等人选 ---- */
-  if (branch === "diag" || (branch === "fix" && forced === null && /(找出|缺陷|问题|哪里不对|有什么毛病)/.test(input))) {
+  /* ---- diag：用户显式要求 → 只读诊断 → 出报告 → 等人选 ---- */
+  if (branch === "diag") {
     if (!ses.prompter) { console.log("诊断模式需要交互确认，请在交互终端中使用。"); return; }
     console.error("[diag] 只读诊断中…");
     const { report } = await ses.diagnose(body);
     const which = await askWhichToFix(ses, report);
     if (!which) { console.log("已取消，未做任何修改。"); return; }
-    body = which === "__all__" ? report : pickIssues(report, which);
+    // 报告已经在对话里了，这里只需说明用户的选择
+    body = `请修复诊断报告中的这些问题：\n${which === "__all__" ? report : pickIssues(report, which)}`;
   }
 
-  /* ---- edit / fix：统一进验证闭环 ---- */
-  const opts: FixOpts = { autoRetry: branch !== "edit", requireConfirm: branch === "edit" };
+  /* ---- agent / edit / fix：模型自己判断；改了文件才进验证闭环 ----
+   *  /fix：用户声明有故障 → 先跑基线验证，把真实报错作为证据
+   *  其余：基线延后到第一次写文件前，纯问答不会白跑测试 */
+  const opts: FixOpts = {
+    autoRetry: branch !== "edit",
+    requireConfirm: branch === "edit",
+    deferBaseline: branch !== "fix",
+  };
   const res = await ses.fix(body, opts);
   console.log(describe(res));
   await appendAudit(ses, {
@@ -160,14 +166,19 @@ async function main() {
       if (input === "/context") { console.log(await ses.context()); continue; }
       if (input === "/pwd") { console.log(ses.cwd); continue; }
       if (input === "/probe") { await ses.probe(); console.log(`已重新探测了 ${ses.cwd}`); continue; }
-      if (input === "/reset") { ses.resetHistory(); console.log("上下文已清空"); continue; }
+      if (input === "/reset") { await ses.resetHistory(); console.log("对话已清空"); continue; }
+      if (input === "/resume") {
+        const n = await ses.resume();
+        console.log(n ? `已恢复上次对话（${n} 条消息，${ses.turns} 轮提问）` : "没有可恢复的对话。");
+        continue;
+      }
       if (input.startsWith("/model ")) {
         ses.model = input.slice(7).trim();     // 只改本会话；所有 LLM 调用都读 ses.model
         console.log(`已切换模型：${ses.model}`);
         continue;
       }
       if (input.startsWith("/cd ")) {
-        try { console.log(`已切换目录：${ses.chdir(input.slice(4).trim())}（历史/撤销点/授权已重置）`); }
+        try { console.log(`已切换目录：${ses.chdir(input.slice(4).trim())}（对话/撤销点/授权已重置；可 /resume 恢复该目录上次的对话）`); }
         catch (e: any) { console.log(e.message); }
         continue;
       }
