@@ -4,6 +4,7 @@ import { runVerify } from "./fix.js";
 import { ensureManifest } from "./probe.js";
 import { MODEL } from "./config.js";
 import type { Msg } from "./memory.js";
+import type { TaskState } from "./taskstate.js";
 
 const DIAGNOSE_PROMPT = `你是代码诊断员，当前为只读模式，不得修改任何文件。
 结合以下真实验证输出和项目代码，输出一份缺陷报告。
@@ -31,7 +32,7 @@ const DIAGNOSE_PROMPT = `你是代码诊断员，当前为只读模式，不得�
 注意：如果某个验证器标注为【环境问题】或【超时】，那不是代码缺陷，请只在报告开头一句话说明"该验证器不可用及原因"，不要把它当作缺陷。`;
 
 export type DiagnoseResult = { report: string; hasRealErrors: boolean };
-export type DiagnoseOpts = { model?: string; sessionId: string; signal?: AbortSignal; messages?: Msg[] };
+export type DiagnoseOpts = { model?: string; sessionId: string; signal?: AbortSignal; messages?: Msg[]; state?: TaskState };
 
 export async function diagnose(task: string, root: string, opts: DiagnoseOpts): Promise<DiagnoseResult> {
   const model = opts.model ?? MODEL;
@@ -54,7 +55,7 @@ export async function diagnose(task: string, root: string, opts: DiagnoseOpts): 
   const ctx = await buildContext(root, model);
   const prompt = DIAGNOSE_PROMPT.replace("{verifyOutput}", () => verifyOutput);
   const r = await runAgent(`${prompt}\n\n用户任务：${task}`, ctx, {
-    root, sessionId: opts.sessionId, model, mode: "ask", signal: opts.signal, messages: opts.messages, task,
+    root, sessionId: opts.sessionId, model, mode: "ask", signal: opts.signal, messages: opts.messages, state: opts.state, task,
   });
   const report = r.status === "done" ? r.text : `[诊断未完成：${r.status}] ${r.text}`;
   return { report, hasRealErrors };

@@ -4,6 +4,7 @@ import path from "node:path";
 import { client } from "./llm.js";
 import { CONTEXT_CHAR_BUDGET, LLM_TIMEOUT_MS } from "./config.js";
 import { truncateMiddle } from "./util.js";
+import type { TaskState } from "./taskstate.js";
 
 /**
  * 会话记忆。
@@ -139,18 +140,19 @@ export async function compactConversation(messages: Msg[], model: string, signal
 
 const FILE = (root: string) => path.join(root, ".agent", "conversation.json");
 
-export async function saveConversation(root: string, messages: Msg[]): Promise<void> {
+/** 对话和任务状态（计划/笔记）一起落盘：它们是同一份"工作记忆" */
+export async function saveConversation(root: string, messages: Msg[], state?: TaskState): Promise<void> {
   try {
     if (messages.length === 0) return;
     await fs.mkdir(path.join(root, ".agent"), { recursive: true });
-    await fs.writeFile(FILE(root), JSON.stringify({ savedAt: Date.now(), messages }));
+    await fs.writeFile(FILE(root), JSON.stringify({ savedAt: Date.now(), messages, state }));
   } catch { /* 持久化失败不应影响主流程 */ }
 }
 
-export async function loadConversation(root: string): Promise<Msg[] | null> {
+export async function loadConversation(root: string): Promise<{ messages: Msg[]; state?: Partial<TaskState> } | null> {
   try {
     const data = JSON.parse(await fs.readFile(FILE(root), "utf-8"));
-    return Array.isArray(data.messages) && data.messages.length ? (data.messages as Msg[]) : null;
+    return Array.isArray(data.messages) && data.messages.length ? { messages: data.messages as Msg[], state: data.state } : null;
   } catch { return null; }
 }
 

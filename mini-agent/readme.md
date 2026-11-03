@@ -17,6 +17,7 @@ mini-agent/
     ├── probe.ts        # 探测语言与可用验证器（结果缓存在 .agent/manifest.json）
     ├── critic.ts       # LLM 评审（只有否决权）
     ├── memory.ts       # 会话记忆：连续 messages、悬空 tool_call 修复、LLM 摘要压缩、落盘/恢复
+    ├── taskstate.ts    # 任务状态：计划 + 工作笔记（update_plan / save_notes），每步注入系统提示，不受历史压缩影响
     ├── diagnose.ts     # 只读诊断（/diag）
     ├── context.ts      # 运行环境 / 验证器 / 项目规则（AGENTS.md 等）
     ├── ui/confirm.ts   # 变更确认 UI（统一走 Session 的 prompter，只有一个 readline）

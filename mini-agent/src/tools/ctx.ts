@@ -2,6 +2,7 @@ import type { Workspace } from "../workspace.js";
 import type { FileOp } from "../policy.js";
 import type { Approval } from "../ui/confirm.js";
 import type { AgentMode } from "../llm.js";
+import type { TaskState } from "../taskstate.js";
 
 export type ApproveFn = (ops: FileOp[]) => Promise<Approval>;
 
@@ -22,6 +23,8 @@ export type ToolCtx = {
   /** 本会话已授权的文件（用户选了 always） */
   approved: Set<string>;
   signal?: AbortSignal;
+  /** 计划与工作笔记（update_plan / save_notes 读写它） */
+  state: TaskState;
   /**
    * 第一次真正写文件之前调用（文件此刻仍是原样）。返回的文本会附在这次写入的结果后面回给模型。
    * 用来把"修改前基线验证"延后到确实要改代码时才做：纯问答/分析的对话不会白跑一遍测试。

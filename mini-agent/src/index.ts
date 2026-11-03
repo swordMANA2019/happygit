@@ -20,7 +20,7 @@ type Branch = "agent" | "ask" | "fix" | "edit" | "diag";
 function printBanner(ses: Session) {
   console.log(`Mini Agent | 模型：${ses.model} | 目录：${ses.cwd} | session：${ses.sessionId}`);
   console.log("直接输入即可（Agent 模式：自行判断回答或修改）。命令：/ask <问题> 只读问答 | /fix <任务> | /edit <任务> | /diag <任务> | /undo");
-  console.log("      /resume 恢复上次对话 | /reset 清空对话 | /probe | /context | /cd <目录> | /pwd | /model <名> | /exit   （任务运行中 Ctrl+C 可中断）");
+  console.log("      /plan 查看计划与笔记 | /resume 恢复上次对话 | /reset 清空对话 | /probe | /context | /cd <目录> | /pwd | /model <名> | /exit   （任务运行中 Ctrl+C 可中断）");
 }
 
 function describe(res: FixResult): string {
@@ -167,6 +167,7 @@ async function main() {
       if (input === "/pwd") { console.log(ses.cwd); continue; }
       if (input === "/probe") { await ses.probe(); console.log(`已重新探测了 ${ses.cwd}`); continue; }
       if (input === "/reset") { await ses.resetHistory(); console.log("对话已清空"); continue; }
+      if (input === "/plan") { console.log(ses.describeState()); continue; }
       if (input === "/resume") {
         const n = await ses.resume();
         console.log(n ? `已恢复上次对话（${n} 条消息，${ses.turns} 轮提问）` : "没有可恢复的对话。");

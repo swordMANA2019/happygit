@@ -11,6 +11,7 @@ import { execCommand } from "./tools/shell.js";
 import { Workspace, gitInfo, untrackedSideEffects } from "./workspace.js";
 import { stripAnsi, truncateMiddle } from "./util.js";
 import type { FailureKind } from "./errors.js";
+import type { TaskState } from "./taskstate.js";
 
 type Msg = OpenAI.Chat.Completions.ChatCompletionMessageParam;
 
@@ -61,6 +62,8 @@ export type FixOpts = {
    * 模型能看到之前所有回合的提问、工具调用与回答。不传则只在本次任务内保持上下文。
    */
   messages?: Msg[];
+  /** 计划与笔记（由 Session 持有，跨回合保留） */
+  state?: TaskState;
   /**
    * 延后基线验证：不在开始前跑测试，而是等模型第一次真正要写文件时才跑（此时文件仍是原样）。
    * 用于"统一入口"：用户的话可能只是提问/分析，此时不应白跑一遍测试；一旦要改代码，基线证据照样拿到。
@@ -209,7 +212,7 @@ export async function runFixTask(task: string, rootDir: string, opts: FixOpts = 
 
       const r = await runAgent(prompt, ctx, {
         root, sessionId, model, mode: "agent", workspace: ws, signal, messages: convo,
-        task, approve: opts.approve, approved, beforeWrite,
+        task, approve: opts.approve, approved, beforeWrite, state: opts.state,
       });
       if (r.text) lastAnswer = r.text;
       const roundLog: string[] = [`--- attempt ${attempt} ---`, `agent: [${r.status}] steps=${r.steps} tools=${r.toolCalls} | ${r.text.slice(0, 200).replace(/\s+/g, " ")}`];

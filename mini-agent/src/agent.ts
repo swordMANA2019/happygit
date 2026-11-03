@@ -14,6 +14,7 @@ import { sleep, truncateMiddle } from "./util.js";
 import { Workspace } from "./workspace.js";
 import { resolveCwd } from "./guard.js";
 import { repairMessages } from "./memory.js";
+import { emptyState, renderStateBlock, updatePlan, saveNotes, type TaskState } from "./taskstate.js";
 
 type Msg = OpenAI.Chat.Completions.ChatCompletionMessageParam;
 
@@ -55,6 +56,8 @@ export type AgentOpts = {
   approve?: ApproveFn;
   approved?: Set<string>;
   beforeWrite?: () => Promise<string | void>;
+  /** 计划与笔记（由 Session 持有，跨回合保留）；不传则只在本次调用内有效 */
+  state?: TaskState;
 };
 
 /* =========================================================================
@@ -112,6 +115,12 @@ async function dispatch(name: string, args: any, ctx: ToolCtx): Promise<string> 
       case "write_file":  return withNote(await writeFile(ctx, args.path, args.content));
       case "edit_file":   return withNote(await editFile(ctx, args.path, args.old_text, args.new_text));
       case "delete_file": return withNote(await deleteFile(ctx, args.path));
+      case "update_plan": {
+        const out = updatePlan(ctx.state, args);
+        console.log(`\n📋 ${out}`);
+        return out;
+      }
+      case "save_notes":  return saveNotes(ctx.state, args);
       case "list_files":  return await listFiles(ctx, args.path ?? ".", args.depth ?? 3);
       case "search_code": return await searchCode(ctx.root, args.query, args.max_results ?? 40);
       case "run_command": {
@@ -248,8 +257,13 @@ export async function runAgent(userContent: string, context: string, opts: Agent
 
   // 系统提示词每回合按当前模式重建（ask/agent 的工具集与规则不同），运行环境/验证器/项目规则放在系统提示里：
   // 它们不属于"对话"，所以不会被历史压缩吞掉，也不会过期（每回合刷新）。
-  const sys: Msg = { role: "system", content: buildSystemPrompt(mode) + (context ? `\n\n${context}` : "") };
-  if (messages[0]?.role === "system") messages[0] = sys; else messages.unshift(sys);
+  // 计划与笔记同样放在系统提示末尾，并且在每一步重新渲染（模型刚更新完计划，下一步就能看到）
+  const state = opts.state ?? emptyState();
+  const makeSys = (): Msg => ({
+    role: "system",
+    content: buildSystemPrompt(mode) + (context ? `\n\n${context}` : "") + renderStateBlock(state),
+  });
+  if (messages[0]?.role === "system") messages[0] = makeSys(); else messages.unshift(makeSys());
 
   repairMessages(messages);
   messages.push({ role: "user", content: userContent });
@@ -265,6 +279,7 @@ export async function runAgent(userContent: string, context: string, opts: Agent
     approved: opts.approved ?? new Set<string>(),
     signal,
     beforeWrite: opts.beforeWrite,
+    state,
   };
 
   let step = 0;
@@ -282,6 +297,7 @@ export async function runAgent(userContent: string, context: string, opts: Agent
       if (signal?.aborted) return result("aborted", lastText || "已中断");
 
       compactMessages(messages);
+      if (messages[0]?.role === "system") messages[0] = makeSys();
       const out = await callLLM(messages, mode, opts.model, signal);
       if (!out.ok) return result(out.aborted ? "aborted" : "llm_error", out.error);
 

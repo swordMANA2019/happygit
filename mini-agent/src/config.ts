@@ -1,7 +1,7 @@
 import "dotenv/config";
 
 export const MODEL = process.env.AGENT_MODEL ?? "gpt-4o-mini";
-export const MAX_STEPS = Number(process.env.AGENT_MAX_STEPS ?? 25);
+export const MAX_STEPS = Number(process.env.AGENT_MAX_STEPS ?? 40);
 
 /**
  * 这里没有工作目录：目录属于 Session（起点是启动时的 process.cwd()，运行中用 /cd 切换），

@@ -10,6 +10,8 @@ type Tool = OpenAI.Chat.Completions.ChatCompletionTool;
 
 export const READ_TOOL_NAMES = ["read_file", "list_files", "search_code"] as const;
 export const WRITE_TOOL_NAMES = ["write_file", "edit_file", "delete_file"] as const;
+/** 只改内存里的任务状态、不碰磁盘：只读模式也可以用 */
+export const STATE_TOOL_NAMES = ["update_plan", "save_notes"] as const;
 
 export const TOOLS: Tool[] = [
   { type: "function", function: {
@@ -50,6 +52,23 @@ export const TOOLS: Tool[] = [
         query: { type: "string" }, max_results: { type: "number" } },
         required: ["query"] } } },
   { type: "function", function: {
+      name: "update_plan",
+      description: "创建/更新任务计划（整体替换）。非平凡任务开始时先建计划，推进过程中随时更新每一步的状态。计划会固定显示在你的系统提示里，不会被历史压缩丢掉。",
+      parameters: { type: "object", properties: {
+        goal: { type: "string", description: "用户最终想达成什么，以及怎样算完成" },
+        steps: { type: "array", description: "有序步骤；同一时刻只应有一个 in_progress", items: {
+          type: "object", properties: {
+            content: { type: "string" },
+            status: { type: "string", enum: ["pending", "in_progress", "done"] },
+          }, required: ["content", "status"] } },
+      }, required: ["steps"] } } },
+  { type: "function", function: {
+      name: "save_notes",
+      description: "保存工作笔记（整体替换，请连同仍然有用的旧内容一起写）：已确认的关键发现、决定、待确认的问题、各来源的要点。笔记固定显示在系统提示里，不会被历史压缩丢掉；读过很多资料后务必记下来。",
+      parameters: { type: "object", properties: {
+        content: { type: "string" },
+      }, required: ["content"] } } },
+  { type: "function", function: {
       name: "run_command",
       description: "在项目根目录执行 shell 命令（编译/测试/lint 等）。stdin 已关闭，不要运行交互式命令；危险命令会被拒绝；超时会杀掉整个进程树",
       parameters: { type: "object", properties: {
@@ -64,15 +83,17 @@ export type AgentMode = "ask" | "agent";
 /** ask 模式只暴露读工具（对应 Cursor 的 Ask 模式）：不是"提示词里说别改"，而是根本拿不到写工具 */
 export function toolsFor(mode: AgentMode): Tool[] {
   if (mode === "agent") return TOOLS;
-  return TOOLS.filter((t) => (READ_TOOL_NAMES as readonly string[]).includes((t as any).function.name));
+  const allowed = [...READ_TOOL_NAMES, ...STATE_TOOL_NAMES] as readonly string[];
+  return TOOLS.filter((t) => allowed.includes((t as any).function.name));
 }
 
-const COMMON = `你是一个运行在本地代码仓库中的编程 Agent，工作方式参考 Cursor。
+const COMMON = `你是一个运行在本地工作目录中的智能助手 Agent，工作方式参考 Cursor。最擅长编程，也处理文档整理、资料分析、写作等以文件为载体的任务。
 
 工作循环：思考 → 调用工具 → 观察结果 → 继续，直到任务完成。每次调用工具前，用一两句话说明你为什么这样做。
 
 通用规则：
-1. 动手前先理解：用 list_files / search_code / read_file 摸清结构与现有约定；优先搜索定位，不要整库乱读。
+1. 动手前先理解：用 list_files / search_code / read_file 摸清结构与现有约定。目标明确的局部任务优先搜索定位；
+   需要全局理解的任务按第 11 条规划后系统地阅读，不要凭几次搜索就下结论。
 2. 所有路径相对项目根目录，禁止越界。
 3. 环境事实以"运行环境"段落为准：不要假设机器上有 git、bash、grep 等；Windows 下优先用 list_files/read_file/search_code，而不是 ls/cat/grep。
 4. 不要执行 git commit / push / reset 等改写仓库状态的命令；回滚由系统检查点负责。
@@ -90,7 +111,16 @@ const COMMON = `你是一个运行在本地代码仓库中的编程 Agent，工�
      "有没有问题/优化/怎么实现"这类需要你【阅读并判断】，靠读代码得出结论，而不是靠搜索命中。
    - 复合/条件请求（"先检查，如果有问题就修"）要按顺序全部完成，包括条件成立后的那一步。
 10. 下结论要有依据：说"没有问题/找不到"之前，必须已经实际读过相关代码；一次搜索无结果不构成结论，换个角度再查。
-11. 对话是连续的：前面回合里的提问、你读过的文件、做过的修改都在上文里。"它/刚才/这个文件/继续/再试一次"指向上文的内容，
+11. 先规划再动手，规模由任务决定：
+    - 简单请求（一两步能答完/做完）直接做，不要建计划。
+    - 需要多个步骤、或要综合多个来源的任务：先用 update_plan 写下目标（含"怎样算完成"）和步骤，再逐步推进，
+      每完成一步就更新状态。计划的第一步通常是"摸清需要了解的范围"。
+    - 范围由你判断而不是一律通读：先用 list_files 等工具获取廉价的概览（有哪些材料、多大、结构如何），
+      再决定哪些必须完整阅读、哪些看概览/局部即可、哪些与任务无关。需要全局理解的任务（分析、总结、综合、写作）
+      应当覆盖所有相关材料；只涉及局部的任务（改一个函数）不必读无关内容。材料太多时分批读，边读边记笔记。
+    - 读完一批材料后用 save_notes 记下要点与结论——旧的工具输出会被折叠、旧的对话会被压缩，只有计划和笔记会一直保留。
+    - 开始一个与之前无关的新任务时，用新计划整体替换旧计划；任务完成后把步骤全部标为 done。
+12. 对话是连续的：前面回合里的提问、你读过的文件、做过的修改都在上文里。"它/刚才/这个文件/继续/再试一次"指向上文的内容，
     直接沿用，不要让用户重复；若出现 [此前对话的摘要] 或 [系统通知]，同样视为真实发生过的事实（如改动已回滚、用户已 /undo）。`;
 
 const ASK = `${COMMON}

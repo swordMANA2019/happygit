@@ -13,6 +13,7 @@ import { MODEL } from "./config.js";
 import {
   type Msg, addNote, compactConversation, saveConversation, loadConversation, clearConversation,
 } from "./memory.js";
+import { type TaskState, emptyState, resetState, loadState, renderPlan } from "./taskstate.js";
 
 /** 向用户提问。signal 触发（Ctrl+C）时应返回 ""，调用方会把空答案当作"拒绝" */
 export type Prompter = { ask(question: string, signal?: AbortSignal): Promise<string> };
@@ -28,6 +29,8 @@ export class Session {
   model: string;
   /** 会话记忆：完整的 OpenAI messages（含工具调用与结果）。永远原地修改，不要替换这个数组 */
   readonly messages: Msg[] = [];
+  /** 计划 + 工作笔记：每一步都注入系统提示，不受历史压缩影响（见 taskstate.ts） */
+  readonly state: TaskState = emptyState();
   /** 最近一次"真正改过文件"的任务的检查点，供 /undo 使用 */
   lastWorkspace: Workspace | null = null;
   /** 用户选过 always 的文件 */
@@ -55,6 +58,7 @@ export class Session {
     if (!ok) throw new Error(`不是有效目录：${next}`);
     this._cwd = next;
     this.messages.length = 0;
+    resetState(this.state);
     this.lastWorkspace = null;
     this.approved.clear();
     return next;
@@ -77,7 +81,7 @@ export class Session {
       return await fn(c.signal);
     } finally {
       this.controller = null;
-      void saveConversation(this._cwd, this.messages);   // 落盘，下次启动可 /resume
+      void saveConversation(this._cwd, this.messages, this.state);   // 落盘，下次启动可 /resume
     }
   }
 
@@ -95,7 +99,7 @@ export class Session {
       const ctx = await this.context();
       return runAgent(input, ctx, {
         root: this._cwd, sessionId: this.sessionId, model: this.model, mode: "ask", signal, task: input,
-        messages: this.messages,
+        messages: this.messages, state: this.state,
       });
     });
   }
@@ -107,7 +111,7 @@ export class Session {
     return this.run(async (signal) => {
       const res = await runFixTask(task, this._cwd, {
         ...opts, signal, sessionId: this.sessionId, model: this.model,
-        approve: this.approveFn(), approved: this.approved, messages: this.messages,
+        approve: this.approveFn(), approved: this.approved, messages: this.messages, state: this.state,
       });
 
       if (res.rolledBack) {
@@ -124,7 +128,7 @@ export class Session {
 
   diagnose(task: string): Promise<DiagnoseResult> {
     return this.run((signal) => diagnose(task, this._cwd, {
-      model: this.model, sessionId: this.sessionId, signal, messages: this.messages,
+      model: this.model, sessionId: this.sessionId, signal, messages: this.messages, state: this.state,
     }));
   }
 
@@ -139,7 +143,7 @@ export class Session {
     const files = await this.lastWorkspace.rollback();
     this.lastWorkspace = null;
     if (files.length) addNote(this.messages, `用户执行了 /undo，以下文件已还原为改动前的内容：${files.join(", ")}。`);
-    void saveConversation(this._cwd, this.messages);
+    void saveConversation(this._cwd, this.messages, this.state);
     return files;
   }
 
@@ -148,13 +152,23 @@ export class Session {
     const saved = await loadConversation(this._cwd);
     if (!saved) return 0;
     this.messages.length = 0;
-    this.messages.push(...saved);
-    return saved.length;
+    this.messages.push(...saved.messages);
+    loadState(this.state, saved.state);
+    return saved.messages.length;
   }
 
-  /** 清空对话（包括磁盘上的落盘） */
+  /** 当前计划与笔记的可读文本（/plan 用） */
+  describeState(): string {
+    const plan = renderPlan(this.state);
+    const parts = [plan ? `计划：\n${plan}` : "（当前没有计划）"];
+    if (this.state.notes) parts.push(`笔记：\n${this.state.notes}`);
+    return parts.join("\n\n");
+  }
+
+  /** 清空对话、计划与笔记（包括磁盘上的落盘） */
   async resetHistory(): Promise<void> {
     this.messages.length = 0;
+    resetState(this.state);
     await clearConversation(this._cwd);
   }
 }
