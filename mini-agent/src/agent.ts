@@ -58,6 +58,10 @@ export type AgentOpts = {
   task?: string;
   approve?: ApproveFn;
   approved?: Set<string>;
+  /** 用户授权过只读访问的项目外目录（Session 持有，跨回合保留） */
+  extraRoots?: Set<string>;
+  /** 首次读取项目外目录时征求同意 */
+  askExternal?: (dir: string) => Promise<boolean>;
   beforeWrite?: () => Promise<string | void>;
   /** 计划与笔记（由 Session 持有，跨回合保留）；不传则只在本次调用内有效 */
   state?: TaskState;
@@ -175,7 +179,7 @@ async function dispatch(name: string, args: any, ctx: ToolCtx): Promise<string> 
           console.log(`\n🔀 子任务开始：${preview(task.replace(/\s+/g, " "), 120)}`);
           const r = await runAgent(task, `## 运行环境\n- 项目根：${ctx.root}`, {
             root: ctx.root, sessionId: ctx.sessionId, model: ctx.model, mode: "ask", sub: true,
-            maxSteps: 20, signal: ctx.signal, jobs: ctx.jobs,
+            maxSteps: 20, signal: ctx.signal, jobs: ctx.jobs, extraRoots: ctx.extraRoots,
           });
           console.log(`🔀 子任务结束（${r.status}，${r.steps} 步）`);
           return truncateMiddle(r.status === "done" ? r.text : `[子任务未完成：${r.status}] ${r.text}`, 8000);
@@ -339,6 +343,8 @@ export async function runAgent(userContent: string, context: string, opts: Agent
     workspace: ws,
     approve: opts.approve,
     approved: opts.approved ?? new Set<string>(),
+    extraRoots: opts.extraRoots ?? new Set<string>(),
+    askExternal: opts.askExternal,
     signal,
     beforeWrite: opts.beforeWrite,
     state,

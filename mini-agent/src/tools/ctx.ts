@@ -17,6 +17,10 @@ export type ToolCtx = {
   root: string;
   sessionId: string;
   mode: AgentMode;
+  /** 用户已授权"只读访问"的项目外目录（会话级，跨回合保留；其下所有文件都可读） */
+  extraRoots: Set<string>;
+  /** 首次读取项目外的某个目录时征求用户同意；缺省 = 非交互（除非 --yes，否则拒绝） */
+  askExternal?: (dir: string) => Promise<boolean>;
   /** 本次任务的原始描述（用于风险评分里的"是否被提及"） */
   task: string;
   workspace: Workspace;

@@ -18,7 +18,7 @@ export const AGENT_ONLY_NAMES = ["run_command", "job_output", "stop_job", "list_
 export const TOOLS: Tool[] = [
   { type: "function", function: {
       name: "read_file",
-      description: "读取项目内文件内容。start_line/end_line 为 1-based 闭区间；大文件请分段读取",
+      description: "读取文件内容（项目内，或用户点名的项目外绝对路径——只读，需授权）。start_line/end_line 为 1-based 闭区间；大文件请分段读取",
       parameters: { type: "object", properties: {
         path: { type: "string" },
         start_line: { type: "number" },
@@ -161,8 +161,11 @@ const COMMON = `你是一个运行在本地工作目录中的智能助手 Agent�
      可以尝试一次合理的补救（如依赖缺失时说明需要安装），否则在总结里明确写出"未能验证及原因"。
 6. 不要为了让检查通过而删除/跳过测试、注释报错、吞异常、放宽断言。
 7. 工具返回 [已拒绝] / [用户拒绝] / [需要用户确认…] 时，说明该操作被安全策略或用户否决：不要重复同一操作，
-   不要换路径绕过（例如读写 .env、node_modules、工作目录之外）；改用其它方案，或在总结里说明阻塞点。
+   不要换路径绕过（例如读写 .env、node_modules）；改用其它方案，或在总结里说明阻塞点。
 8. 路径写错时工具会给出候选文件，请用候选里的准确相对路径重试。
+   路径可以是相对工作目录的，也可以是绝对路径。用户点名的工作目录之外的文件/目录（如 /mnt/abc/temp/a.c）：
+   直接把用户给的绝对路径传给 read_file / list_files / read_document，首次访问时系统会征求用户授权；
+   项目外的位置只读，不能写。若提示"未授权"，如实告诉用户，不要改用别的路径猜。
 9. 理解用户想要的结果，而不是字面：先在心里把请求拆成"用户最终想达成什么"，再规划步骤。
    - 用户点名的文件/函数就是目标，先定位并读它；不要把用户说的话当搜索关键字去撞代码。
    - search_code 只做字面量匹配（内容和文件名），只适合搜代码里真实存在的标识符/字符串；

@@ -1,7 +1,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { IGNORE } from "../config.js";
-import { resolvePath, isSensitivePath, type ResolveResult } from "../guard.js";
+import { resolvePath, isSensitivePath, isUnderAny, type ResolveResult } from "../guard.js";
 import { classify, decide, type FileOp } from "../policy.js";
 import { autoAllowed } from "../ui/confirm.js";
 import type { ToolCtx } from "./ctx.js";
@@ -20,6 +20,34 @@ function hint(r: Pick<ResolveResult, "note" | "candidates">, op: string): string
     return `${head}\n候选：\n${r.candidates.map((c, i) => `${i + 1}. ${c}`).join("\n")}\n请用上述准确路径重试，或用 list_files 进一步确认。`;
   }
   return `${head}\n请先用 list_files / search_code 确认真实路径后再操作。`;
+}
+
+/** 读类工具可以使用的解析结果 */
+export const isReadable = (r: ResolveResult) => r.status === "exact" || r.status === "converged" || r.status === "external";
+
+/**
+ * 读类工具（read_file / list_files / read_document / view_image）的统一解析：
+ * 项目内照常；项目外已存在的路径 → 首次需要用户授权，授权后整个所在目录在本会话内可读（只读）。
+ * 写操作不走这里，仍然只能在项目内。
+ */
+export async function resolveForRead(ctx: ToolCtx, p: unknown): Promise<ResolveResult> {
+  const r = resolvePath(ctx.root, p, { external: true });
+  if (r.status !== "external") return r;
+  if (isUnderAny(r.abs, ctx.extraRoots)) return r;
+
+  let dir = r.abs;
+  try { if (!(await fs.stat(r.abs)).isDirectory()) dir = path.dirname(r.abs); } catch { /* 按原路径处理 */ }
+
+  const ok = autoAllowed() ? true : ctx.askExternal ? await ctx.askExternal(dir) : false;
+  if (!ok) {
+    return {
+      status: "outside", abs: r.abs, candidates: [],
+      note: `${r.abs} 在工作目录外，需要用户授权才能读取${ctx.askExternal ? "（用户未同意）" : "（当前是非交互环境，可用 --yes 启动，或 /cd 切换到该目录）"}。不要重复尝试；请在回复里说明这一点。`,
+    };
+  }
+  ctx.extraRoots.add(dir);
+  console.error(`[audit] EXTERNAL READ GRANTED ${dir}`);
+  return r;
 }
 
 /**
@@ -48,8 +76,8 @@ async function gate(ctx: ToolCtx, op: FileOp): Promise<string | null> {
 
 /** start/end 为 1-based 闭区间 */
 export async function readFile(ctx: ToolCtx, p: unknown, start?: number, end?: number): Promise<string> {
-  const r = resolvePath(ctx.root, p);
-  if (r.status !== "exact" && r.status !== "converged") return hint(r, "读取");
+  const r = await resolveForRead(ctx, p);
+  if (!isReadable(r)) return hint(r, "读取");
 
   const st = await fs.stat(r.abs);
   if (st.isDirectory()) return `${String(p)} 是目录，请用 list_files`;
@@ -146,8 +174,8 @@ export async function deleteFile(ctx: ToolCtx, p: unknown): Promise<string> {
 }
 
 export async function listFiles(ctx: ToolCtx, p: unknown, depth = 3): Promise<string> {
-  const r = resolvePath(ctx.root, p ?? ".");
-  if (r.status !== "exact" && r.status !== "converged") return hint(r, "列出");
+  const r = await resolveForRead(ctx, p ?? ".");
+  if (!isReadable(r)) return hint(r, "列出");
   const parts: string[] = [];
   const LIMIT = 500;
   let truncated = false;
@@ -172,5 +200,5 @@ export async function listFiles(ctx: ToolCtx, p: unknown, depth = 3): Promise<st
   }
   await walk(r.abs, depth);
   if (truncated) parts.push(`…（超过 ${LIMIT} 项已截断，请指定子目录或减小 depth）`);
-  return parts.join("\n") || `(空目录：${path.relative(ctx.root, r.abs) || "."})`;
+  return parts.join("\n") || `(空目录：${r.status === "external" ? r.abs : path.relative(ctx.root, r.abs) || "."})`;
 }

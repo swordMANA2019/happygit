@@ -13,6 +13,7 @@ import { MODEL } from "./config.js";
 import {
   type Msg, addNote, compactConversation, saveConversation, loadConversation, clearConversation,
 } from "./memory.js";
+import { buildDiffs, type FileDiff } from "./ui/diffview.js";
 import { JobManager } from "./tools/jobs.js";
 import { McpManager } from "./mcp.js";
 import { discoverSkills, skillsBlock } from "./skills.js";
@@ -42,6 +43,8 @@ export class Session {
   lastWorkspace: Workspace | null = null;
   /** 用户选过 always 的文件 */
   readonly approved = new Set<string>();
+  /** 用户授权过"只读访问"的项目外目录（如 /mnt/abc/temp）；切换项目目录时清空 */
+  readonly extraRoots = new Set<string>();
 
   private _cwd: string;
   private controller: AbortController | null = null;
@@ -68,6 +71,7 @@ export class Session {
     resetState(this.state);
     this.lastWorkspace = null;
     this.approved.clear();
+    this.extraRoots.clear();
     return next;
   }
 
@@ -103,6 +107,19 @@ export class Session {
     return (ops) => confirmOps((q) => p.ask(q, this.controller?.signal), ops);
   }
 
+  /** 读取项目外目录前的授权提问；没有交互终端就不授权（--yes 在工具层另行放行） */
+  private askExternalFn(): ((dir: string) => Promise<boolean>) | undefined {
+    const p = this.prompter;
+    if (!p) return undefined;
+    return async (dir) => {
+      const ans = (await p.ask(
+        `\n🔓 Agent 想【只读】访问项目外的目录：${dir}\n   允许吗？ [Y]es（本会话内该目录下可读） / [n]o: `,
+        this.controller?.signal,
+      )).trim().toLowerCase();
+      return ans === "y" || ans === "yes";
+    };
+  }
+
   /** 技能清单（+ 已连接的外部工具说明）：拼进系统提示 */
   private async extraContext(withMcp: boolean): Promise<string> {
     const skills = await discoverSkills(this._cwd).catch(() => []);
@@ -118,6 +135,7 @@ export class Session {
       return runAgent(input, ctx, {
         root: this._cwd, sessionId: this.sessionId, model: this.model, mode: "ask", signal, task: input,
         messages: this.messages, state: this.state, jobs: this.jobs,
+        extraRoots: this.extraRoots, askExternal: this.askExternalFn(),
       });
     });
   }
@@ -132,6 +150,7 @@ export class Session {
         ...opts, signal, sessionId: this.sessionId, model: this.model,
         approve: this.approveFn(), approved: this.approved, messages: this.messages, state: this.state,
         jobs: this.jobs, mcp: this.mcp, extraContext: await this.extraContext(true),
+        extraRoots: this.extraRoots, askExternal: this.askExternalFn(),
       });
 
       if (res.rolledBack) {
@@ -196,6 +215,13 @@ export class Session {
   describeJobs(): string {
     const all = this.jobs.list();
     return all.length ? all.map((j) => this.jobs.describe(j)).join("\n") : "没有后台任务。";
+  }
+
+  /** 最近一次改动的结构化 diff（/diff 用）；没有可看的改动返回 null */
+  async lastDiffs(): Promise<FileDiff[] | null> {
+    if (!this.lastWorkspace) return null;
+    const diffs = buildDiffs(await this.lastWorkspace.changes());
+    return diffs.length ? diffs : null;
   }
 
   /** 退出前清理：终止后台任务、关闭外部工具进程 */

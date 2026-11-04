@@ -1,7 +1,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { unzipSync, strFromU8 } from "fflate";
-import { resolvePath } from "../guard.js";
+import { resolveForRead, isReadable } from "./fs.js";
 import type { ToolCtx } from "./ctx.js";
 
 /**
@@ -114,8 +114,8 @@ const MAX_IMAGE_BYTES = 4 * 1024 * 1024;
 
 /** view_image：读图片并排队，由 agent 循环作为下一条 user 消息附上（tool 消息本身不能带图片） */
 export async function loadImage(ctx: ToolCtx, p: unknown): Promise<string> {
-  const r = resolvePath(ctx.root, p);
-  if (r.status !== "exact" && r.status !== "converged") {
+  const r = await resolveForRead(ctx, p);
+  if (!isReadable(r)) {
     return `无法读取：${r.note}${r.candidates.length ? `\n候选：${r.candidates.join(", ")}` : ""}`;
   }
   const mime = IMAGE_MIME[path.extname(r.abs).toLowerCase()];
@@ -129,8 +129,8 @@ export async function loadImage(ctx: ToolCtx, p: unknown): Promise<string> {
 
 /** start_page/end_page 仅对 pdf 生效；超长内容截断并提示如何继续 */
 export async function readDocument(ctx: ToolCtx, p: unknown, startPage?: number, endPage?: number): Promise<string> {
-  const r = resolvePath(ctx.root, p);
-  if (r.status !== "exact" && r.status !== "converged") {
+  const r = await resolveForRead(ctx, p);
+  if (!isReadable(r)) {
     return `无法读取：${r.note}${r.candidates.length ? `\n候选：${r.candidates.join(", ")}` : ""}\n请先用 list_files 确认真实路径。`;
   }
   const ext = path.extname(r.abs).toLowerCase();

@@ -5,6 +5,10 @@ import { stdin, stdout } from "node:process";
 import { MODEL } from "./config.js";
 import { Session, type Prompter } from "./session.js";
 import type { FixResult, FixOpts } from "./fix.js";
+import {
+  buildDiffs, renderSummary, renderFileDiff, pickDiffs, writeHtml, openExternal, openInIde,
+} from "./ui/diffview.js";
+import { runDiffViewer, openInVim } from "./ui/diffviewer.js";
 
 /**
  * 没有"意图路由器"：不再由一个分类器（LLM 或关键字）先替用户决定这句话是问答还是修改。
@@ -19,7 +23,7 @@ type Branch = "agent" | "ask" | "fix" | "edit" | "diag";
 
 function printBanner(ses: Session) {
   console.log(`Mini Agent | 模型：${ses.model} | 目录：${ses.cwd} | session：${ses.sessionId}`);
-  console.log("直接输入即可（Agent 模式：自行判断回答或修改）。命令：/ask <问题> 只读问答 | /fix <任务> | /edit <任务> | /diag <任务> | /undo");
+  console.log("直接输入即可（Agent 模式：自行判断回答或修改）。命令：/ask <问题> 只读问答 | /fix <任务> | /edit <任务> | /diag <任务> | /undo | /diff [编号|html|ide] 高亮查看改动");
   console.log("      /plan 计划与笔记 | /jobs 后台任务 | /skills 技能 | /mcp [reload] 外部工具 | /resume 恢复上次对话 | /reset 清空对话 | /probe | /context | /cd <目录> | /pwd | /model <名> | /exit   （任务运行中 Ctrl+C 可中断）");
 }
 
@@ -72,6 +76,51 @@ async function appendAudit(ses: Session, record: Record<string, unknown>) {
   } catch { /* 审计失败不应影响主流程 */ }
 }
 
+/**
+ * /diff [编号|路径]        内置交互式查看器（默认；任何终端都能用，不需要 vim / 浏览器）
+ * /diff print [编号|路径]  直接把高亮 diff 打印到终端（可复制、可重定向）
+ * /diff vim [编号|路径]    用 vim -d 对比（没有 vim 时自动改用内置查看器）
+ * /diff html [编号|路径]   生成 HTML（每个文件点击展开）并用浏览器打开
+ * /diff ide [编号|路径]    用 Cursor / VS Code 的 diff 编辑器打开
+ */
+async function handleDiff(ses: Session, arg: string): Promise<void> {
+  const diffs = await ses.lastDiffs();
+  if (!diffs) { console.log("没有可查看的改动（最近一次任务没有修改文件，或已被 /undo 撤销）。"); return; }
+
+  const m = /^(print|vim|html|ide)\b\s*(.*)$/i.exec(arg.trim());
+  const mode = m ? m[1].toLowerCase() : "view";
+  const sel = m ? m[2] : arg;
+
+  const picked = pickDiffs(diffs, sel);
+  if (typeof picked === "string") { console.log(picked); return; }
+
+  if (mode === "view") {
+    // 没指定文件 → 从文件列表开始；指定了 → 直接进入该文件
+    await runDiffViewer(sel.trim() && sel.trim() !== "all" ? picked : diffs, sel.trim() && sel.trim() !== "all" && picked.length === 1 ? 0 : undefined);
+    return;
+  }
+  if (mode === "vim") {
+    if (!(await openInVim(ses.sessionId, picked))) {
+      console.log("没有找到 vim（Windows 默认没有），改用内置查看器。");
+      await runDiffViewer(picked);
+    }
+    return;
+  }
+
+  if (mode === "html") {
+    const file = await writeHtml(ses.cwd, picked);
+    const opened = await openExternal(file);
+    console.log(opened ? `已在浏览器中打开：${file}` : `已生成：${file}\n（当前环境无法自动打开浏览器；用 Cursor/VS Code 或浏览器打开该文件即可，每个文件点击标题展开）`);
+    return;
+  }
+  if (mode === "ide") {
+    const r = await openInIde(ses.sessionId, picked);
+    console.log(r.note);
+    return;
+  }
+  for (const d of picked) console.log(`\n${renderFileDiff(d)}`);
+}
+
 /* ---- 单条输入的处理（REPL 与单次调用共用） ---- */
 
 async function handle(ses: Session, input: string): Promise<void> {
@@ -114,6 +163,10 @@ async function handle(ses: Session, input: string): Promise<void> {
   };
   const res = await ses.fix(body, opts);
   console.log(describe(res));
+  if (res.changedFiles.length && !res.rolledBack) {
+    const summary = renderSummary(buildDiffs(await res.workspace.changes()));
+    if (summary) console.log(`\n${summary}`);
+  }
   await appendAudit(ses, {
     cwd: ses.cwd, branch, task: body.slice(0, 200),
     status: res.status, attempts: res.attempts, files: res.changedFiles, warnings: res.warnings.length,
@@ -189,6 +242,7 @@ async function main() {
         catch (e: any) { console.log(e.message); }
         continue;
       }
+      if (input === "/diff" || input.startsWith("/diff ")) { await handleDiff(ses, input.slice(5)); continue; }
       if (input === "/undo") {
         const files = await ses.undo();
         console.log(files === null ? "没有可撤销的改动。" :

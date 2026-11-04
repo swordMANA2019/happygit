@@ -20,6 +20,17 @@ import { execCommand } from "./tools/shell.js";
 
 type Original = Buffer | null; // null = 文件原本不存在
 
+export type FileChange = {
+  rel: string;
+  abs: string;
+  kind: "added" | "modified" | "deleted";
+  /** 新建文件 / 二进制文件为 null */
+  before: string | null;
+  /** 删除的文件 / 二进制文件为 null */
+  after: string | null;
+  binary: boolean;
+};
+
 export class Workspace {
   private journal = new Map<string, Original>();
 
@@ -85,6 +96,27 @@ export class Workspace {
     return restored.sort();
   }
 
+  /** 结构化的改动列表（给 /diff 的高亮视图用）：每个文件的前后内容；二进制只标记不带内容 */
+  async changes(): Promise<FileChange[]> {
+    const out: FileChange[] = [];
+    const isBin = (b: Buffer | null) => !!b && b.subarray(0, 8000).includes(0);
+    for (const [abs, orig] of this.journal) {
+      const cur = await fs.readFile(abs).catch(() => null);
+      if (cur === null && orig === null) continue;
+      if (cur && orig && cur.equals(orig)) continue;
+      const binary = isBin(cur) || isBin(orig);
+      out.push({
+        rel: this.rel(abs),
+        abs,
+        kind: orig === null ? "added" : cur === null ? "deleted" : "modified",
+        before: binary || orig === null ? null : orig.toString("utf8"),
+        after: binary || cur === null ? null : cur.toString("utf8"),
+        binary,
+      });
+    }
+    return out.sort((a, b) => a.rel.localeCompare(b.rel));
+  }
+
   /** 不依赖 git 的 unified diff（给 critic / 用户看） */
   async diff(maxChars = 60_000): Promise<string> {
     const parts: string[] = [];
@@ -104,9 +136,9 @@ export class Workspace {
 
 /* ---- 简易 unified diff（LCS；超大文件退化为"首尾裁剪"） ---- */
 
-type Op = { t: " " | "-" | "+"; s: string };
+export type Op = { t: " " | "-" | "+"; s: string };
 
-function diffOps(a: string[], b: string[]): Op[] {
+export function diffOps(a: string[], b: string[]): Op[] {
   let pre = 0;
   while (pre < a.length && pre < b.length && a[pre] === b[pre]) pre++;
   let suf = 0;

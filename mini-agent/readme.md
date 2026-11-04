@@ -18,6 +18,8 @@ mini-agent/
     ├── critic.ts       # LLM 评审（只有否决权）
     ├── memory.ts       # 会话记忆：连续 messages、悬空 tool_call 修复、LLM 摘要压缩、落盘/恢复
     ├── taskstate.ts    # 任务状态：计划 + 工作笔记（update_plan / save_notes），每步注入系统提示，不受历史压缩影响
+    ├── ui/diffview.ts  # 高亮 diff：数据（hunk + 行内变化）/ 摘要 / 终端打印 / HTML / IDE 打开
+    ├── ui/diffviewer.ts # 交互式 diff 查看器（并排、跳转、备用屏幕）+ 可选 vim -d
     ├── skills.ts       # 技能加载：SKILL.md（name/description/verify/verify_ext），渐进披露，use_skill 才读正文
     ├── mcp.ts          # MCP 客户端（stdio JSON-RPC），工具超过 20 个时改用 mcp_search_tools + mcp_call
     ├── runtime.ts      # 运行环境探测（Python 等），供技能占位符 {python} 使用
@@ -72,6 +74,23 @@ mini-agent/
 - 凭据文件（.env、*.pem、id_rsa 等）默认不可读/不可写/不进搜索结果（AGENT_ALLOW_SECRETS=1 可关闭）。
 - 高风险写操作（删除、新建配置类文件、风险评分过低）需确认；非交互环境下会被拒绝而不是默认放行；
   --yes 或 AGENT_AUTO_APPROVE=1 可整体放行。
+
+路径与项目外文件：
+- 路径可相对工作目录，也可绝对。root 是符号链接/挂载点（/mnt/build → /data/build）时，两种写法都认。
+- 项目外已存在的绝对路径（如 /mnt/abc/temp/a.c）：read_file / list_files / read_document / view_image 可读，
+  首次访问该目录时询问用户，同意后本会话内该目录可读（--yes 免问）；项目外一律不可写（要改请 /cd）。
+  ~/.ssh、~/.aws、/etc/shadow 等系统凭据位置始终拒绝（AGENT_ALLOW_SECRETS=1 可关闭）。
+- 不存在的绝对路径仍会按"去掉前缀当相对路径"纠错（模型常把 src/a.ts 写成 /src/a.ts）。
+
+改动查看（对应 Cursor 的 diff 面板）：
+- 任务结束后自动打印变更摘要（每个文件 +新增 −删除）。
+- /diff：内置交互式查看器（纯 Node，Windows/macOS/Linux 终端都能用，不需要 vim/浏览器/IDE）。
+  文件列表 ↑↓ 选择、Enter 打开 → 左右并排（旧 | 新）高亮：红/绿整行底色 + 行内词级加深 + 新旧行号 + 上下文折叠；
+  n/p 在改动块间跳转，←→ 切换文件，u 切并排/统一视图，Esc 回列表，q 退出。/diff <编号|路径> 直接打开某个文件。
+- /diff print [编号|路径]：把高亮 diff 直接打印出来（可复制/重定向；写文件前确认里按 d 也是这个视图）。
+- /diff vim：用 vim -d 对比（找 nvim / vim / vimdiff；Windows 会找 Git for Windows 自带的 vim；都没有就自动改用内置查看器）。
+- /diff html：生成 .agent/diff.html（每个文件点击标题展开/折叠）并尝试用浏览器打开。
+- /diff ide [编号]：用 Cursor / VS Code 的内置 diff 编辑器对比（需要 `cursor` / `code` 命令在 PATH 里）。
 
 长任务（pip install torch 之类）：
 - run_command 前台只等 timeout_ms（默认较短）；还没结束就【转入后台 job】，不杀进程，返回 job id，并明确告诉模型"这不是失败"。

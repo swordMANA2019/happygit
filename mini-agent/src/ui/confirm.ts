@@ -1,6 +1,6 @@
 import type { FileOp } from "../policy.js";
 import { diffSummary } from "../policy.js";
-import { unifiedDiff } from "../workspace.js";
+import { buildFileDiff, renderFileDiff } from "./diffview.js";
 
 const G = "\x1b[32m";
 const R = "\x1b[31m";
@@ -30,13 +30,20 @@ export async function confirmOps(ask: AskFn, ops: FileOp[]): Promise<Approval> {
     if (ans === "n" || ans === "no" || ans === "") return "no";
     if (ans === "a" || ans === "always") return "always";
     if (ans === "d" || ans === "diff") {
-      for (const f of ops) console.log(`\n${B}${f.path}${X}\n${makeDiff(f)}`);
+      for (const f of ops) console.log(`\n${makeDiff(f)}`);
     }
   }
 }
 
+/** 确认时看到的 diff 与 /diff 同一套高亮渲染（红/绿底色 + 行内加深 + 行号） */
 function makeDiff(op: FileOp): string {
-  return unifiedDiff(op.path, op.action === "create" ? null : op.before, op.action === "delete" ? null : op.after) || "(无差异)";
+  const before = op.action === "create" ? null : op.before;
+  const after = op.action === "delete" ? null : op.after;
+  const d = buildFileDiff({
+    rel: op.path, abs: op.resolved.abs, binary: false, before, after,
+    kind: op.action === "create" ? "added" : op.action === "delete" ? "deleted" : "modified",
+  });
+  return d.hunks.length ? renderFileDiff(d) : "(无差异)";
 }
 
 export function autoAllowed(): boolean {

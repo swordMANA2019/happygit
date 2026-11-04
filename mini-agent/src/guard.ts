@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 
 /**
@@ -11,7 +12,8 @@ export type ResolveStatus =
   | "converged"  // 绝对路径被收敛到 root 内（如 /src/a.ts → <root>/src/a.ts）
   | "new"        // 尚不存在、在 root 内，且调用方声明了要新建
   | "candidate"  // 不存在，但按文件名搜到候选
-  | "outside"    // 落在 root 外
+  | "external"   // 已存在、在 root 外、只读：需要调用方（tools/fs.ts resolveForRead）取得用户授权后才可读
+  | "outside"    // 落在 root 外（不可用）
   | "escape"     // realpath 后跳出 root（symlink 逃逸）
   | "notfound"   // 不存在且无候选
   | "blocked";   // .git / node_modules(写) / 凭据文件 等受保护路径
@@ -31,6 +33,8 @@ export type ResolveOpts = {
   /** 仅 write 有意义：允许目标不存在（新建文件） */
   create?: boolean;
   maxCandidates?: number;
+  /** 仅 read 有意义：允许返回 "external"（root 外已存在的文件/目录，由调用方负责授权） */
+  external?: boolean;
 };
 
 const CASE_INSENSITIVE = process.platform === "win32" || process.platform === "darwin";
@@ -52,12 +56,38 @@ export function isSensitivePath(rel: string): boolean {
   return SECRET_RE.test(rel.replace(/\\/g, "/"));
 }
 
+/**
+ * root 外的路径即使用户授权也不读的位置：系统凭据、远程登录密钥、云厂商配置、伪文件系统。
+ * （项目内的凭据文件由 SECRET_RE 管；这里管"root 外"的那一批。）
+ */
+const EXTERNAL_SENSITIVE =
+  /(^|\/)\.(?:ssh|aws|gnupg|kube|azure)(?:\/|$)|(^|\/)\.config\/gcloud(?:\/|$)|(^|\/)\.docker\/config\.json$|^\/etc\/(?:shadow|gshadow|sudoers(?:\.d)?|ssh\/ssh_host_[^/]+)$|^\/(?:proc|sys|dev)(?:\/|$)|\/windows\/system32\/config(?:\/|$)/i;
+
 const norm = (p: string) => (CASE_INSENSITIVE ? path.resolve(p).toLowerCase() : path.resolve(p));
 
+/**
+ * p 是否等于 root 或位于 root 之下。
+ * 用 path.relative 判断，而不是字符串前缀：能正确处理 root 带/不带结尾分隔符、
+ * 根目录（/、C:\）、Windows 不同盘符、以及 "/mnt/build2" 不应算在 "/mnt/build" 里这类情况。
+ */
 export function isInside(p: string, root: string): boolean {
-  const a = norm(p);
-  const r = norm(root);
-  return a === r || a.startsWith(r.endsWith(path.sep) ? r : r + path.sep);
+  const rel = path.relative(norm(root), norm(p));
+  if (rel === "") return true;
+  if (path.isAbsolute(rel)) return false;                       // 不同盘符
+  return rel !== ".." && !rel.startsWith(".." + path.sep);       // 目录名恰好叫 "..foo" 不算越界
+}
+
+/** 展开 ~ / ~/xxx（模型和用户都常这样写家目录） */
+function expandHome(p: string): string {
+  if (p === "~") return os.homedir();
+  if (p.startsWith("~/") || p.startsWith("~\\")) return path.join(os.homedir(), p.slice(2));
+  return p;
+}
+
+/** p 是否落在任一授权目录之下 */
+export function isUnderAny(p: string, roots: Iterable<string>): boolean {
+  for (const r of roots) if (isInside(p, r)) return true;
+  return false;
 }
 
 export function resolvePath(root: string, p: unknown, opts: ResolveOpts = {}): ResolveResult {
@@ -65,35 +95,41 @@ export function resolvePath(root: string, p: unknown, opts: ResolveOpts = {}): R
   const maxCand = opts.maxCandidates ?? 8;
 
   if (!p || typeof p !== "string") return reject("路径为空");
-  const raw = p.trim();
-  if (!raw) return reject("路径为空");
-  if (raw.includes("\0")) return reject("路径含空字节");
+  const trimmed = p.trim();
+  if (!trimmed) return reject("路径为空");
+  if (trimmed.includes("\0")) return reject("路径含空字节");
+  const raw = expandHome(trimmed);
 
   const normRoot = path.resolve(root);
+  // root 可能是符号链接 / 挂载点（如 /mnt/build -> /data/build）：用户和模型可能用任一种写法，
+  // 旧实现只认字面前缀，于是 /data/build/x.py 被当成"root 外"，收敛成 <root>/data/build/x.py 后报"不存在"。
+  const realRoot = safeRealpath(normRoot);
+  const insideRoot = (q: string) => isInside(q, normRoot) || isInside(q, realRoot);
 
-  // 1) 绝对路径：本来就在 root 内就直接用（旧实现一律剥掉盘符/前导斜杠，
-  //    于是模型给出的合法绝对路径 C:\proj\src\a.ts 会被拼成 <root>\proj\src\a.ts 然后"找不到"）。
-  //    不在 root 内才收敛：剥掉前缀当作相对路径，永远不会真的去碰 root 外的位置。
-  let abs: string;
+  // 1) 先按字面解析（绝对路径直接用，相对路径接在 root 后面）
+  let abs = path.isAbsolute(raw) ? path.resolve(raw) : path.resolve(normRoot, raw);
   let converged = false;
-  if (path.isAbsolute(raw)) {
-    const direct = path.resolve(raw);
-    if (isInside(direct, normRoot)) {
-      abs = direct;
-    } else {
+
+  if (!insideRoot(abs)) {
+    const realCandidate = nearestRealpath(abs);
+    if (realCandidate && isInside(realCandidate, realRoot)) {
+      // 经别名（symlink）写出的路径，真实位置在 root 内：算内部
+    } else if (fs.existsSync(abs)) {
+      // 2) 真实存在、但在 root 外（如 /mnt/abc/temp/a.c）：不再静默改写成 <root>/mnt/abc/...
+      return externalResult(raw, abs, intent, opts.external === true);
+    } else if (path.isAbsolute(raw)) {
+      // 3) 不存在的绝对路径：多半是模型把项目内路径写成了 /src/a.ts，剥掉前缀当相对路径
       const cleaned = raw.replace(/^[A-Za-z]:/, "").replace(/^[\\/]+/, "");
       abs = path.resolve(normRoot, cleaned);
       converged = true;
+    } else {
+      return outside(raw, abs);               // ../../x 且不存在
     }
-  } else {
-    abs = path.resolve(normRoot, raw);
   }
 
-  // 2) 越界（../../x）
-  if (!isInside(abs, normRoot)) return outside(raw, abs);
-
-  // 3) 黑名单 / 凭据：不管存不存在都拦
-  const rel = path.relative(normRoot, abs).replace(/\\/g, "/");
+  // 4) 黑名单 / 凭据：不管存不存在都拦
+  const base = [normRoot, realRoot].find((r) => isInside(abs, r));
+  const rel = (base ? path.relative(base, abs) : path.relative(realRoot, safeRealpath(abs))).replace(/\\/g, "/");
   if (BLOCKED_ALWAYS.test(rel)) return blocked(`禁止操作受保护路径：${rel}`);
   if (intent === "write" && BLOCKED_WRITE.test(rel)) return blocked(`禁止写入受保护路径：${rel}`);
   if (isSensitivePath(rel)) {
@@ -101,7 +137,6 @@ export function resolvePath(root: string, p: unknown, opts: ResolveOpts = {}): R
   }
 
   // 4) symlink 逃逸：用最近的已存在祖先做 realpath
-  const realRoot = safeRealpath(normRoot);
   const realAbs = nearestRealpath(abs);
   if (realAbs && !isInside(realAbs, realRoot)) return escape(raw, abs, realAbs);
 
@@ -122,7 +157,21 @@ export function resolvePath(root: string, p: unknown, opts: ResolveOpts = {}): R
   const hits = findFilesByNameSync(normRoot, path.basename(raw), maxCand + 1);
   if (hits.length === 1) return candidate(path.join(normRoot, hits[0]), hits, `未找到 "${raw}"，命中单个候选：${hits[0]}`);
   if (hits.length > 1) return candidate(abs, hits.slice(0, maxCand), `未找到 "${raw}"，候选：${hits.slice(0, maxCand).join("、")}`);
-  return notfound(raw, rel);
+  return notfound(raw, converged ? "" : rel);   // 收敛过的路径 rel 是被改写后的，报错要显示用户原本给的路径
+}
+
+/** root 外、已存在的目标：写一律不行；读需要 opts.external，并且仍要通过敏感路径检查 */
+function externalResult(input: string, abs: string, intent: Intent, allowExternal: boolean): ResolveResult {
+  const fwd = abs.replace(/\\/g, "/");
+  if (BLOCKED_ALWAYS.test(fwd)) return blocked(`禁止操作受保护路径：${abs}`);
+  if (isSensitivePath(fwd) || (process.env.AGENT_ALLOW_SECRETS !== "1" && EXTERNAL_SENSITIVE.test(fwd))) {
+    return blocked(`${abs} 疑似系统凭据/密钥位置，默认禁止访问（内容会被发送给 LLM 服务商）。确需访问请设置 AGENT_ALLOW_SECRETS=1`);
+  }
+  if (intent === "write") {
+    return { status: "outside", abs, note: `${abs} 在工作目录外，只允许读取，不允许修改。如需修改请先用 /cd 切换到该目录。`, candidates: [] };
+  }
+  if (!allowExternal) return outside(input, abs);
+  return { status: "external", abs, note: `${abs} 在工作目录外（只读）`, candidates: [] };
 }
 
 const exact = (abs: string): ResolveResult => ({ status: "exact", abs, note: "", candidates: [] });

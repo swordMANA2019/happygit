@@ -61,6 +61,9 @@ export type FixOpts = {
   approve?: ApproveFn;
   /** 本会话已授权的文件集合（跨多次任务共享） */
   approved?: Set<string>;
+  /** 项目外只读目录的授权（Session 持有） */
+  extraRoots?: Set<string>;
+  askExternal?: (dir: string) => Promise<boolean>;
   /**
    * 会话历史（由 Session 持有，会被原地追加）。传入后本次任务就是这段连续对话的一个回合：
    * 模型能看到之前所有回合的提问、工具调用与回答。不传则只在本次任务内保持上下文。
@@ -232,6 +235,7 @@ export async function runFixTask(task: string, rootDir: string, opts: FixOpts = 
         root, sessionId, model, mode: "agent", workspace: ws, signal, messages: convo,
         task, approve: opts.approve, approved, beforeWrite, state: opts.state,
         jobs: opts.jobs, mcp: opts.mcp, usedSkills,
+        extraRoots: opts.extraRoots, askExternal: opts.askExternal,
       });
       if (r.text) lastAnswer = r.text;
       const roundLog: string[] = [`--- attempt ${attempt} ---`, `agent: [${r.status}] steps=${r.steps} tools=${r.toolCalls} | ${r.text.slice(0, 200).replace(/\s+/g, " ")}`];
