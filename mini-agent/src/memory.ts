@@ -3,7 +3,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { client } from "./llm.js";
 import { CONTEXT_CHAR_BUDGET, LLM_TIMEOUT_MS } from "./config.js";
-import { truncateMiddle } from "./util.js";
+import { truncateMiddle, withHeartbeat } from "./util.js";
 import type { TaskState } from "./taskstate.js";
 
 /**
@@ -119,13 +119,14 @@ export async function compactConversation(messages: Msg[], model: string, signal
   const transcript = truncateMiddle(older.map(render).filter(Boolean).join("\n"), 80_000);
 
   try {
-    const resp = await client.chat.completions.create(
+    console.log(`\n🗜️  对话较长，正在整理历史…`);
+    const resp = await withHeartbeat("整理对话历史", () => client.chat.completions.create(
       {
         model, temperature: 0,
         messages: [{ role: "system", content: SUMMARY_PROMPT }, { role: "user", content: transcript }],
       },
       { signal, timeout: LLM_TIMEOUT_MS },
-    );
+    ));
     const summary = resp.choices?.[0]?.message?.content?.trim();
     if (!summary) return false;
     messages.splice(

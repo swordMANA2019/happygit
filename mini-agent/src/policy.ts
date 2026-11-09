@@ -69,6 +69,8 @@ export function decide(op: FileOp, approved?: ReadonlySet<string>): Decision {
   if (s === "outside" || s === "escape" || s === "blocked" || s === "notfound" || s === "candidate") {
     return { verdict: "deny", why: op.resolved.note || `路径不可用（${s}）` };
   }
+  // 自测草稿区（.agent/scratch）：测试脚本/假数据随便写、随便删，不打扰用户
+  if (/\/\.agent\/scratch\//.test(op.resolved.abs.replace(/\\/g, "/"))) return { verdict: "allow", why: "自测草稿区" };
   if (op.action === "delete") return { verdict: "ask", why: "删除文件" };
   if (approved?.has(op.resolved.abs)) return { verdict: "allow", why: "本会话已授权" };
   if (op.action === "create" && isConfigLike(op.path)) return { verdict: "ask", why: "新建配置类文件" };

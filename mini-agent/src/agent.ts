@@ -11,9 +11,11 @@ import { isMcpToolName, type McpManager } from "./mcp.js";
 import type { ToolCtx, ApproveFn } from "./tools/ctx.js";
 import {
   MAX_STEPS, TOOL_OUTPUT_CAP, LLM_MAX_RETRIES, LLM_TIMEOUT_MS, CONTEXT_CHAR_BUDGET,
+  LLM_FIRST_TOKEN_MS, LLM_IDLE_MS, LLM_TOTAL_MS, LLM_STREAM, HEARTBEAT_MS, EXTRA_BODY, EARLY_FOLD_RATIO,
 } from "./config.js";
+import { stats } from "./stats.js";
 import { classifyLlmError } from "./errors.js";
-import { sleep, truncateMiddle } from "./util.js";
+import { sleep, truncateMiddle, fmtSecs, withHeartbeat } from "./util.js";
 import { Workspace } from "./workspace.js";
 import { resolveCwd } from "./guard.js";
 import { repairMessages } from "./memory.js";
@@ -39,6 +41,10 @@ export type AgentResult = {
   messages: Msg[];
   steps: number;
   toolCalls: number;
+  /** 本次真正执行了多少次 run_command（自测验证用它判断"模型是不是真的跑过命令"） */
+  commandRuns: number;
+  /** 最近一次写入之后模型自己运行过的"有意义的命令"（排除 cat/ls 之类）：数量、最后一条是否成功、命令文本 */
+  evidence: { runs: number; lastOk: boolean | null; lastCmd: string };
   workspace: Workspace;
 };
 
@@ -96,6 +102,9 @@ const READ_SET = new Set<string>(READ_TOOL_NAMES);
 const WRITE_SET = new Set<string>(WRITE_TOOL_NAMES);
 const AGENT_ONLY_SET = new Set<string>(AGENT_ONLY_NAMES);
 /** 互不依赖、可以同一轮并发执行的调用：纯读 + 子 Agent */
+/** 只是"看一眼"的命令：不能算作"改完后验证过"的证据 */
+const TRIVIAL_CMD = /^\s*(cat|ls|dir|type|echo|pwd|cd|head|tail|wc|find|tree|which|where|get-content|get-childitem|git\s+(status|diff|log|show))\b/i;
+
 const PARALLEL_SET = new Set<string>([...READ_TOOL_NAMES, "delegate"]);
 /** 轮询类调用：合法地反复出现，不参与"原地打转"检测 */
 const POLLING_SET = new Set<string>(["job_output", "list_jobs"]);
@@ -165,6 +174,7 @@ async function dispatch(name: string, args: any, ctx: ToolCtx): Promise<string> 
       }
       case "run_command": {
         const cwd = resolveCwd(ctx.root, args.cwd);
+        ctx.commandRuns++;
         return await runCommandJob(ctx.jobs, args.command, {
           cwd, timeoutMs: args.timeout_ms, background: args.background === true, signal: ctx.signal,
         });
@@ -213,6 +223,40 @@ function msgSize(m: Msg): number {
   const tcs = (m as any).tool_calls;
   if (tcs) n += JSON.stringify(tcs).length;
   return n;
+}
+
+/**
+ * 提前折叠：写大文件的任务里，每个 write_file 的整份内容都留在历史里、每一步都被重新发给模型——
+ * 但这些文件已经在磁盘上了（需要时 read_file 即可）。历史长到预算的 EARLY_FOLD_RATIO 就开始折叠
+ * 较早的 write_file/edit_file 大参数（最近 3 轮保留原样；保持 JSON 合法，路径等字段不动）。
+ * 比"超预算才折叠"早得多：每步少发几万字符，就是每步少等几秒的预填充时间。
+ */
+export function foldOldWrites(messages: Msg[], budget = CONTEXT_CHAR_BUDGET, keepRecentTurns = 3): number {
+  let total = messages.reduce((s, m) => s + msgSize(m), 0);
+  if (total < budget * EARLY_FOLD_RATIO) return 0;
+
+  const turns = messages.map((m, i) => ((m as any).tool_calls?.length ? i : -1)).filter((i) => i >= 0);
+  const old = turns.slice(0, Math.max(turns.length - keepRecentTurns, 0));
+  let folded = 0;
+  for (const i of old) {
+    for (const tc of (messages[i] as any).tool_calls ?? []) {
+      const name = tc.function?.name;
+      if (name !== "write_file" && name !== "edit_file") continue;
+      const raw: string = tc.function?.arguments ?? "";
+      if (raw.length < 1200) continue;
+      try {
+        const a = JSON.parse(raw);
+        for (const k of ["content", "old_text", "new_text"]) {
+          if (typeof a[k] === "string" && a[k].length > 500) a[k] = `[已折叠 ${a[k].length} 字符：这部分已写入磁盘，需要请 read_file]`;
+        }
+        const next = JSON.stringify(a);
+        total -= raw.length - next.length;
+        tc.function.arguments = next;
+        folded++;
+      } catch { /* 参数不是合法 JSON：不动 */ }
+    }
+  }
+  return folded;
 }
 
 export function compactMessages(messages: Msg[], budget = CONTEXT_CHAR_BUDGET, keepRecent = 8): number {
@@ -273,21 +317,171 @@ async function abortableSleep(ms: number, signal?: AbortSignal) {
   ]);
 }
 
-async function callLLM(messages: Msg[], tools: OpenAI.Chat.Completions.ChatCompletionTool[], model: string, signal?: AbortSignal): Promise<LlmOutcome> {
+/** 网关不支持 stream 时自动降级为一次性响应（进程内记住，不再反复试） */
+let streamingBroken = !LLM_STREAM;
+
+type Completion = OpenAI.Chat.Completions.ChatCompletion;
+
+/**
+ * 一次性（非流式）请求：整个响应必须在 LLM_TIMEOUT_MS 内返回。
+ * 写长文件（比如几百行的训练脚本）时模型要生成很久，这种方式很容易超时——所以默认走下面的流式版本。
+ */
+async function completeOnce(messages: Msg[], tools: OpenAI.Chat.Completions.ChatCompletionTool[], model: string, signal: AbortSignal | undefined, quiet: boolean): Promise<Completion> {
+  return withHeartbeat(`等待模型响应（${currentStepLabel}）`, () =>
+    client.chat.completions.create(
+      { ...EXTRA_BODY, model, messages, tools, tool_choice: "auto", temperature: 0 } as any,
+      { signal, timeout: LLM_TIMEOUT_MS },
+    ), { quiet });
+}
+
+let currentStepLabel = "";
+/** 最近一次成功调用的输出规模（流式才有思考字符数），给耗时统计用 */
+let lastCallMeta = { out: 0, think: 0 };
+
+/**
+ * 流式请求：不再有"整个响应必须在 N 秒内完成"的限制，改为三道看门狗——
+ *   首包超时（LLM_FIRST_TOKEN_MS）/ 数据流静默超时（LLM_IDLE_MS）/ 总时长上限（LLM_TOTAL_MS）。
+ * 模型只要还在持续输出就不会超时；同时周期性打印"已收到多少字符、正在生成哪个工具调用"，终端不会看起来卡死。
+ */
+async function completeStream(messages: Msg[], tools: OpenAI.Chat.Completions.ChatCompletionTool[], model: string, signal: AbortSignal | undefined, quiet: boolean): Promise<Completion> {
+  const ac = new AbortController();
+  const onAbort = () => ac.abort();
+  if (signal?.aborted) ac.abort(); else signal?.addEventListener("abort", onAbort, { once: true });
+
+  const t0 = Date.now();
+  let lastChunk = t0;
+  let seenFirst = false;
+  let timeoutReason = "";
+  let received = 0;
+  let thinking = 0;
+  let activeTool = "";
+
+  const watchdog = setInterval(() => {
+    const now = Date.now();
+    if (now - t0 > LLM_TOTAL_MS) timeoutReason = `单次响应超过总时限 ${fmtSecs(LLM_TOTAL_MS)}`;
+    else if (!seenFirst && now - t0 > LLM_FIRST_TOKEN_MS) timeoutReason = `${fmtSecs(LLM_FIRST_TOKEN_MS)} 内没有收到任何响应`;
+    else if (seenFirst && now - lastChunk > LLM_IDLE_MS) timeoutReason = `数据流中断：${fmtSecs(LLM_IDLE_MS)} 没有新数据`;
+    if (timeoutReason) ac.abort();
+  }, 1000);
+  watchdog.unref?.();
+
+  const progress = quiet ? null : setInterval(() => {
+    const el = fmtSecs(Date.now() - t0);
+    console.log(!seenFirst
+      ? `⏳ 等待模型响应（${currentStepLabel}）…已 ${el}`
+      : received === 0 && thinking > 0
+        ? `🧠 模型思考中（${currentStepLabel}）…已 ${el}，思考 ${thinking} 字符（可用 AGENT_EXTRA_BODY 关闭思考以提速）`
+        : `✍️  模型正在输出${activeTool ? `（${activeTool}）` : ""}…已 ${el}，收到 ${received} 字符${thinking ? `，思考 ${thinking} 字符` : ""}`);
+  }, HEARTBEAT_MS);
+  progress?.unref?.();
+
+  try {
+    const stream = (await client.chat.completions.create(
+      { ...EXTRA_BODY, model, messages, tools, tool_choice: "auto", temperature: 0, stream: true } as any,
+      { signal: ac.signal, timeout: LLM_FIRST_TOKEN_MS },
+    )) as unknown as AsyncIterable<OpenAI.Chat.Completions.ChatCompletionChunk>;
+
+    let content = "";
+    let finish: string | null = null;
+    const calls: Array<{ id: string; type: "function"; function: { name: string; arguments: string } }> = [];
+
+    for await (const chunk of stream) {
+      lastChunk = Date.now();
+      seenFirst = true;
+      const ch: any = chunk.choices?.[0];
+      if (!ch) continue;
+      const d = ch.delta ?? {};
+      if (d.content) { content += d.content; received += d.content.length; }
+      // 推理模型（GLM/DeepSeek-R1/Qwen3 等）会先流出一大段"思考"，它不属于答案但同样占时间
+      const think = d.reasoning_content ?? d.reasoning;
+      if (typeof think === "string" && think) thinking += think.length;
+      for (const t of d.tool_calls ?? []) {
+        const i = t.index ?? 0;
+        const cur = (calls[i] ??= { id: "", type: "function", function: { name: "", arguments: "" } });
+        if (t.id) cur.id = t.id;
+        // 名字只在第一块出现；个别兼容网关每块都带，所以已有名字就不再拼接
+        if (t.function?.name && !cur.function.name) cur.function.name = t.function.name;
+        if (t.function?.arguments) { cur.function.arguments += t.function.arguments; received += t.function.arguments.length; }
+        if (cur.function.name) activeTool = cur.function.name;
+      }
+      if (ch.finish_reason) finish = ch.finish_reason;
+    }
+
+    // SDK 的流在被 abort 时是"静默结束"而不是抛错：必须在这里自己判断，否则被看门狗截断的半截回复会被当成完整答案
+    if (timeoutReason) throw Object.assign(new Error(`模型响应超时：${timeoutReason}`), { name: "APIConnectionTimeoutError" });
+    if (!finish && calls.length) throw Object.assign(new Error("模型响应数据流意外中断（工具调用参数不完整）"), { name: "APIConnectionError" });
+
+    const toolCalls = calls.filter(Boolean).map((c, i) => ({ ...c, id: c.id || `call_${Date.now().toString(36)}_${i}` }));
+    if (!content && !toolCalls.length && !finish) throw Object.assign(new Error("模型返回了空数据流"), { status: 502 });
+
+    const dt = Date.now() - t0;
+    lastCallMeta = { out: received, think: thinking };
+    if (!quiet && dt > 20_000) console.log(`（本次模型调用用时 ${fmtSecs(dt)}，输出 ${received} 字符${thinking ? `，思考 ${thinking} 字符` : ""}）`);
+
+    return {
+      id: "stream", object: "chat.completion", created: Math.floor(t0 / 1000), model,
+      choices: [{
+        index: 0, logprobs: null, finish_reason: (finish ?? "stop") as any,
+        message: { role: "assistant", content: content || null, refusal: null, ...(toolCalls.length ? { tool_calls: toolCalls } : {}) },
+      }],
+    } as Completion;
+  } catch (e: any) {
+    // 我们自己的看门狗触发的中止：转成"可重试的超时"，并说清楚原因
+    if (timeoutReason && !signal?.aborted) {
+      throw Object.assign(new Error(`模型响应超时：${timeoutReason}`), { name: "APIConnectionTimeoutError" });
+    }
+    throw e;
+  } finally {
+    clearInterval(watchdog);
+    if (progress) clearInterval(progress);
+    signal?.removeEventListener("abort", onAbort);
+  }
+}
+
+async function callLLM(
+  messages: Msg[], tools: OpenAI.Chat.Completions.ChatCompletionTool[], model: string,
+  signal?: AbortSignal, quiet = false,
+): Promise<LlmOutcome> {
   let overflowHandled = false;
+  let timeouts = 0;
 
   for (let attempt = 0; ; attempt++) {
     if (signal?.aborted) return { ok: false, error: "已中断", aborted: true };
+    const callStart = Date.now();
     try {
-      const resp = await client.chat.completions.create(
-        { model, messages, tools, tool_choice: "auto", temperature: 0 },
-        { signal, timeout: LLM_TIMEOUT_MS },
-      );
+      lastCallMeta = { out: 0, think: 0 };
+      const resp = streamingBroken
+        ? await completeOnce(messages, tools, model, signal, quiet)
+        : await completeStream(messages, tools, model, signal, quiet);
       if (!resp.choices?.[0]?.message) throw Object.assign(new Error("模型返回了空 choices"), { status: 502 });
+      const m: any = resp.choices[0].message;
+      const outChars = lastCallMeta.out || ((m.content?.length ?? 0) + (m.tool_calls ?? []).reduce((s: number, t: any) => s + (t.function?.arguments?.length ?? 0), 0));
+      // 子 Agent（quiet）的调用也算：它们确实占用了时间
+      stats().llm(Date.now() - callStart, messages.reduce((s, x) => s + msgSize(x), 0), outChars, lastCallMeta.think);
       return { ok: true, resp };
     } catch (e: any) {
       if (signal?.aborted) return { ok: false, error: "已中断", aborted: true };
       const info = classifyLlmError(e);
+
+      // 网关不支持 stream：降级为一次性响应后立刻重试（不算失败次数）
+      if (!streamingBroken && (e?.status === 400 || e?.status === 404 || e?.status === 422 || e?.status === 501) && /stream/i.test(String(e?.message ?? ""))) {
+        streamingBroken = true;
+        console.error(`[llm] 接口不支持流式响应，已改用一次性响应（长输出更容易超时；可调大 AGENT_LLM_TIMEOUT_MS）`);
+        attempt--;
+        continue;
+      }
+
+      // 连续两次超时：重发同样的请求只会再超时一次。给模型一条提示，让它把输出拆小
+      if (/超时|timed? ?out|Timeout/i.test(info.message) || e?.name === "APIConnectionTimeoutError") {
+        timeouts++;
+        if (timeouts === 2 && info.retryable && attempt < LLM_MAX_RETRIES) {
+          messages.push({
+            role: "user",
+            content: "[系统] 前两次生成都超时了。请把输出拆小：长文件先用 write_file 写骨架/第一部分，再用 edit_file 分段补充；每次工具调用的内容控制在约 150 行以内。",
+          });
+          console.error("[llm] 连续超时，已提示模型把输出拆小");
+        }
+      }
 
       if (info.contextOverflow && !overflowHandled) {
         overflowHandled = true;
@@ -353,6 +547,7 @@ export async function runAgent(userContent: string, context: string, opts: Agent
     mcp: opts.mcp,
     usedSkills: opts.usedSkills ?? new Set<string>(),
     pendingImages: [],
+    commandRuns: 0,
     depth: opts.sub ? 1 : 0,
   };
   const log: (...a: any[]) => void = opts.sub ? () => {} : console.log;
@@ -364,17 +559,20 @@ export async function runAgent(userContent: string, context: string, opts: Agent
   let emptyReplies = 0;
   let lastText = "";
   const seen = new Map<string, number>();
+  let evidence: AgentResult["evidence"] = { runs: 0, lastOk: null, lastCmd: "" };
 
   const result = (status: AgentStatus, text: string): AgentResult =>
-    ({ status, text, messages, steps: step, toolCalls, workspace: ws });
+    ({ status, text, messages, steps: step, toolCalls, commandRuns: ctx.commandRuns, evidence, workspace: ws });
 
   try {
     for (step = 1; step <= maxSteps; step++) {
       if (signal?.aborted) return result("aborted", lastText || "已中断");
 
+      foldOldWrites(messages);
       compactMessages(messages);
       if (messages[0]?.role === "system") messages[0] = makeSys();
-      const out = await callLLM(messages, tools, opts.model, signal);
+      currentStepLabel = `步骤 ${step}`;
+      const out = await callLLM(messages, tools, opts.model, signal, !!opts.sub);
       if (!out.ok) return result(out.aborted ? "aborted" : "llm_error", out.error);
 
       const choice = out.resp.choices[0];
@@ -418,8 +616,18 @@ export async function runAgent(userContent: string, context: string, opts: Agent
         const n = POLLING_SET.has(fn) ? 0 : (seen.get(key) ?? 0) + 1;
         if (!POLLING_SET.has(fn)) seen.set(key, n);
 
+        const t0 = Date.now();
         let res = await dispatch(fn, args, ctx);
-        if (WRITE_SET.has(fn) && res.startsWith("已")) writes++;
+        stats().tool(fn, Date.now() - t0);
+        if (WRITE_SET.has(fn) && res.startsWith("已")) {
+          writes++;
+          evidence = { runs: 0, lastOk: null, lastCmd: "" };   // 改了文件：之前跑过的命令不再算数
+        }
+        if (fn === "run_command" && !res.startsWith("[已拒绝]") && !TRIVIAL_CMD.test(String(args.command ?? ""))) {
+          const failed = /^\[(命令失败|命令已被终止|工具错误|参数错误|已中断)/.test(res);
+          const bg = /^\[(已在后台|仍在运行)/.test(res);
+          evidence = { runs: evidence.runs + 1, lastOk: bg ? null : !failed, lastCmd: String(args.command ?? "") };
+        }
         if (n === 3) res += `\n[提示] 你已第 ${n} 次执行完全相同的调用且没有任何新进展。请换一种思路，或结束并说明阻塞点。`;
         return res;
       };

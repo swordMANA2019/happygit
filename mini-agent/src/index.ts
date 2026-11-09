@@ -2,7 +2,7 @@ import readline from "node:readline/promises";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { stdin, stdout } from "node:process";
-import { MODEL } from "./config.js";
+import { MODEL, ALWAYS_STATS } from "./config.js";
 import { Session, type Prompter } from "./session.js";
 import type { FixResult, FixOpts } from "./fix.js";
 import {
@@ -35,6 +35,8 @@ function describe(res: FixResult): string {
   switch (res.status) {
     case "fixed":
       return `${answer}\n✅ 修改完成（${res.attempts} 轮，验证通过）${files}\n（不满意可输入 /undo 撤销）\n${res.log}`;
+    case "selftested":
+      return `${answer}\n✅ 修改完成，并通过【模型黑盒自测】（项目没有自带验证器；结论取决于上面“验证”一节里的实际运行证据）${files}\n（不满意可输入 /undo 撤销）\n${res.log}`;
     case "unverified":
       return `${answer}\n⚠️  已完成修改，但【未能自动验证】（详见 warnings）${files}\n（可输入 /undo 撤销）\n${res.log}`;
     case "no_change":
@@ -167,6 +169,8 @@ async function handle(ses: Session, input: string): Promise<void> {
     const summary = renderSummary(buildDiffs(await res.workspace.changes()));
     if (summary) console.log(`\n${summary}`);
   }
+  // 耗时统计：任务超过 20 秒才显示（AGENT_STATS=1 则总是显示），回答"时间花在哪了"
+  if (res.timing && (ALWAYS_STATS || res.elapsedMs > 20_000)) console.log(`\n${res.timing}`);
   await appendAudit(ses, {
     cwd: ses.cwd, branch, task: body.slice(0, 200),
     status: res.status, attempts: res.attempts, files: res.changedFiles, warnings: res.warnings.length,

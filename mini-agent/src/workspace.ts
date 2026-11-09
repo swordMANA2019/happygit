@@ -2,6 +2,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import crypto from "node:crypto";
 import { execCommand } from "./tools/shell.js";
+import { SCRATCH_RE } from "./guard.js";
 
 /**
  * Workspace = Agent 对项目文件改动的"事务日志"（对应 Cursor 的 checkpoint / 一键撤销）。
@@ -51,10 +52,16 @@ export class Workspace {
     return path.relative(this.root, abs).split(path.sep).join("/");
   }
 
-  /** 真正发生了内容变化的文件（写入相同内容不算） */
+  /** 自测草稿区（.agent/scratch）里的文件：仍然进 journal（回滚时会清掉），但不算"用户的改动" */
+  private isScratch(abs: string) {
+    return SCRATCH_RE.test(this.rel(abs));
+  }
+
+  /** 真正发生了内容变化的文件（写入相同内容不算；不含自测草稿） */
   async changedFiles(): Promise<string[]> {
     const out: string[] = [];
     for (const [abs, orig] of this.journal) {
+      if (this.isScratch(abs)) continue;
       const cur = await fs.readFile(abs).catch(() => null);
       const same = (cur === null && orig === null) || (cur && orig && cur.equals(orig));
       if (!same) out.push(this.rel(abs));
@@ -87,7 +94,7 @@ export class Workspace {
           await fs.mkdir(path.dirname(abs), { recursive: true });
           await fs.writeFile(abs, orig);
         }
-        restored.push(this.rel(abs));
+        if (!this.isScratch(abs)) restored.push(this.rel(abs));   // 草稿区也会被清掉，但不用向用户汇报
       } catch {
         /* 单个文件还原失败不应阻断其余文件 */
       }
@@ -101,6 +108,7 @@ export class Workspace {
     const out: FileChange[] = [];
     const isBin = (b: Buffer | null) => !!b && b.subarray(0, 8000).includes(0);
     for (const [abs, orig] of this.journal) {
+      if (this.isScratch(abs)) continue;
       const cur = await fs.readFile(abs).catch(() => null);
       if (cur === null && orig === null) continue;
       if (cur && orig && cur.equals(orig)) continue;
@@ -121,6 +129,7 @@ export class Workspace {
   async diff(maxChars = 60_000): Promise<string> {
     const parts: string[] = [];
     for (const [abs, orig] of this.journal) {
+      if (this.isScratch(abs)) continue;
       const cur = await fs.readFile(abs).catch(() => null);
       if (cur === null && orig === null) continue;
       if (cur && orig && cur.equals(orig)) continue;

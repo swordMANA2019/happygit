@@ -45,6 +45,12 @@ const BLOCKED_ALWAYS = /(^|\/)(?:\.git|\.svn|\.hg)(?:\/|$)/i;
 const BLOCKED_WRITE = /(^|\/)(?:node_modules|\.agent)(?:\/|$)/i;
 
 /**
+ * 黑盒自测的草稿区：Agent 写测试脚本/假数据/假服务的地方。允许写入（尽管在 .agent 下），
+ * 并且不算进用户的改动（Workspace 会把它们从 changedFiles / diff 里排除）。
+ */
+export const SCRATCH_RE = /^\.agent\/scratch(?:\/|$)/;
+
+/**
  * 凭据 / 私钥：读取它们等于把密钥发给了 LLM 服务商。
  * .env.example / .env.sample 是模板，放行。AGENT_ALLOW_SECRETS=1 可整体关闭。
  */
@@ -131,7 +137,7 @@ export function resolvePath(root: string, p: unknown, opts: ResolveOpts = {}): R
   const base = [normRoot, realRoot].find((r) => isInside(abs, r));
   const rel = (base ? path.relative(base, abs) : path.relative(realRoot, safeRealpath(abs))).replace(/\\/g, "/");
   if (BLOCKED_ALWAYS.test(rel)) return blocked(`禁止操作受保护路径：${rel}`);
-  if (intent === "write" && BLOCKED_WRITE.test(rel)) return blocked(`禁止写入受保护路径：${rel}`);
+  if (intent === "write" && BLOCKED_WRITE.test(rel) && !SCRATCH_RE.test(rel)) return blocked(`禁止写入受保护路径：${rel}`);
   if (isSensitivePath(rel)) {
     return blocked(`${rel} 疑似密钥/凭据文件，默认禁止访问（它的内容会被发送给 LLM 服务商）。确需访问请设置 AGENT_ALLOW_SECRETS=1`);
   }

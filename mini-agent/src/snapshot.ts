@@ -16,7 +16,7 @@ import { IGNORE } from "./config.js";
 export type Snapshot = Map<string, string>;   // 相对路径 -> "mtimeMs:size"
 
 const MAX_ENTRIES = 20_000;
-const MAX_MS = 4_000;
+const MAX_MS = 1_500;   // 每次任务至少扫两遍：超时就放弃（只是"提示产出了哪些文件"的附加功能，不值得让用户等）
 
 /** 目录太大/太慢时返回 null（放弃这项附加功能，不影响主流程） */
 export async function snapshotTree(root: string): Promise<Snapshot | null> {

@@ -41,6 +41,8 @@ export type ToolCtx = {
   usedSkills: Set<string>;
   /** view_image 排队等待附加到下一条消息的图片 */
   pendingImages: Array<{ path: string; dataUrl: string }>;
+  /** 本次 runAgent 里 run_command 被执行的次数 */
+  commandRuns: number;
   /** 子 Agent 深度：>0 时不能再 delegate；输出静默 */
   depth: number;
   /**
