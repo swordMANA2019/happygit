@@ -99,7 +99,18 @@ LLM 超时与"看起来卡死"：
 - 任务结束后打印耗时统计（超过 20s 才显示；`AGENT_STATS=1` 总是显示）：总用时、各阶段（准备/主循环/验证/评审/自测）、
   模型调用次数与耗时、平均每次发送的字符数、思考字符数、各工具累计耗时。慢在哪一眼可见，调优以它为准。
 - 推理模型（GLM / DeepSeek-R1 / Qwen3 等）每一步都会先"思考"一大段，是最常见的慢因。流式进度会显示"🧠 思考中…思考 N 字符"。
-  可用 `AGENT_EXTRA_BODY` 给每个请求附加字段来关闭，例如智谱 GLM：`AGENT_EXTRA_BODY='{"thinking":{"type":"disabled"}}'`。
+  GLM 系列模型现在默认自动关闭思考（`AGENT_THINKING=auto`；主循环、历史摘要、评审、探测都生效；接口返回 400 说不认 thinking 时会自动撤销）。
+  需要深度推理时设 `AGENT_THINKING=on`；其它模型（Qwen3/DeepSeek 等）用 `AGENT_EXTRA_BODY` 按网关要求关闭，
+  例如 `AGENT_EXTRA_BODY='{"enable_thinking":false}'`；`AGENT_EXTRA_BODY` 里显式写了 `thinking` 则以它为准。
+- 省 token：
+  - 任务结束的统计里有接口返回的真实用量（输入 / 缓存命中 / 输出 / 其中思考 token）；流式请求会带 `stream_options.include_usage`（网关不认会自动撤销）。
+  - 已设置关闭思考、模型却仍在输出思考内容时，会警告一次（说明网关/模型忽略了该参数）；
+    并且思考超过 `AGENT_THINK_MAX_CHARS`（6000 字符，0 = 不限）仍无任何输出，就中止这次生成（停止计费）、带一条临时提示重试一次。
+  - 每一步都会重发整份历史，所以输入 token ≈ 步数 × 历史长度：`AGENT_CONTEXT_CHARS`（默认 120k 字符）、
+    `AGENT_TOOL_OUTPUT_CAP`（单个工具结果上限，默认 10k 字符）、`AGENT_EARLY_FOLD_RATIO`（历史到预算的 25% 起就把
+    最近 10 个之前的大块工具输出与写文件参数折叠）共同控制。
+- 整理对话历史：较早的对话切成最多 `AGENT_SUMMARY_PARALLEL`（4）段并行摘要，每段 `AGENT_SUMMARY_MAX_TOKENS`（1200）封顶，
+  可用 `AGENT_SUMMARY_MODEL` 指定更快的模型；并且每个回合结束后就在后台预先整理（`AGENT_BG_COMPACT=0` 关闭），下一回合开始时直接套用。
 - 少绕弯：提示词要求同一轮里并行发出互相独立的工具调用（含 update_plan/save_notes），单个文件一次写完（≤~300 行），
   简单任务不建计划；已读过的文件不重复读。
 - 历史里较早的 write_file/edit_file 大参数从预算的 25%（`AGENT_EARLY_FOLD_RATIO`）起就折叠——文件已在磁盘上，不必每步重发。

@@ -1,6 +1,7 @@
 // src/critic.ts（无 zod 版，其余不变）
+import type OpenAI from "openai";
 import { client} from "./llm.js";
-import { MODEL } from "./config.js";
+import { MODEL, extraBodyFor } from "./config.js";
 
 export type CriticResult = {
   pass: boolean;
@@ -38,9 +39,9 @@ export async function runCritic(ctx: CriticCtx, model: string = MODEL): Promise<
   for (let i = 0; i < 3; i++) {
     try {
       const resp = await client.chat.completions.create({
-        model, messages: [{ role: "user", content: body }], temperature: 0,
+        ...extraBodyFor(model), model, messages: [{ role: "user", content: body }], temperature: 0,
         response_format: { type: "json_object" },
-      });
+      } as any) as OpenAI.Chat.Completions.ChatCompletion;
       const r = parse(JSON.parse(resp.choices[0].message.content ?? "{}"));
       if (r) return r;
     } catch {}

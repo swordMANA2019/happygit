@@ -11,7 +11,7 @@ import { isMcpToolName, type McpManager } from "./mcp.js";
 import type { ToolCtx, ApproveFn } from "./tools/ctx.js";
 import {
   MAX_STEPS, TOOL_OUTPUT_CAP, LLM_MAX_RETRIES, LLM_TIMEOUT_MS, CONTEXT_CHAR_BUDGET,
-  LLM_FIRST_TOKEN_MS, LLM_IDLE_MS, LLM_TOTAL_MS, LLM_STREAM, HEARTBEAT_MS, EXTRA_BODY, EARLY_FOLD_RATIO,
+  LLM_FIRST_TOKEN_MS, LLM_IDLE_MS, LLM_TOTAL_MS, LLM_STREAM, HEARTBEAT_MS, THINK_MAX_CHARS, extraBodyFor, autoThinkingOff, disableAutoThinking, EARLY_FOLD_RATIO,
 } from "./config.js";
 import { stats } from "./stats.js";
 import { classifyLlmError } from "./errors.js";
@@ -259,6 +259,29 @@ export function foldOldWrites(messages: Msg[], budget = CONTEXT_CHAR_BUDGET, kee
   return folded;
 }
 
+/**
+ * 提前折叠旧的工具输出：每一步都会把整份历史重发一遍，一个 10k 字符的 read_file 结果放在历史里，
+ * 之后 N 步就是 N 倍的输入 token。历史长到预算的 EARLY_FOLD_RATIO 就开始，把"最近 keepRecent 个之前"的
+ * 大块工具输出收成"头部 + 标记"（需要时模型可重新调用工具；重要结论应该已经记在 save_notes / 计划里）。
+ * 只改 content，不动 tool_call_id 配对。
+ */
+export function foldOldToolOutputs(messages: Msg[], budget = CONTEXT_CHAR_BUDGET, keepRecent = 10, minLen = 1500): number {
+  let total = messages.reduce((s, m) => s + msgSize(m), 0);
+  if (total < budget * EARLY_FOLD_RATIO) return 0;
+  const toolIdx = messages.map((m, i) => (m.role === "tool" ? i : -1)).filter((i) => i >= 0);
+  const old = toolIdx.slice(0, Math.max(toolIdx.length - keepRecent, 0));
+  let folded = 0;
+  for (const i of old) {
+    const m = messages[i] as any;
+    if (typeof m.content !== "string" || m.content.length < minLen) continue;
+    const before = m.content.length;
+    m.content = `[较早的工具输出已折叠，原 ${before} 字符；如需请重新调用工具] ${m.content.slice(0, 400).replace(/\s+/g, " ")}…`;
+    total -= before - m.content.length;
+    folded++;
+  }
+  return folded;
+}
+
 export function compactMessages(messages: Msg[], budget = CONTEXT_CHAR_BUDGET, keepRecent = 8): number {
   let total = messages.reduce((s, m) => s + msgSize(m), 0);
   if (total <= budget) return 0;
@@ -327,24 +350,34 @@ type Completion = OpenAI.Chat.Completions.ChatCompletion;
  * 写长文件（比如几百行的训练脚本）时模型要生成很久，这种方式很容易超时——所以默认走下面的流式版本。
  */
 async function completeOnce(messages: Msg[], tools: OpenAI.Chat.Completions.ChatCompletionTool[], model: string, signal: AbortSignal | undefined, quiet: boolean): Promise<Completion> {
-  return withHeartbeat(`等待模型响应（${currentStepLabel}）`, () =>
+  const resp = await withHeartbeat(`等待模型响应（${currentStepLabel}）`, () =>
     client.chat.completions.create(
-      { ...EXTRA_BODY, model, messages, tools, tool_choice: "auto", temperature: 0 } as any,
+      { ...extraBodyFor(model), model, messages, tools, tool_choice: "auto", temperature: 0 } as any,
       { signal, timeout: LLM_TIMEOUT_MS },
-    ), { quiet });
+    ), { quiet }) as Completion;
+  lastCallMeta.usage = (resp as any).usage;
+  return resp;
 }
 
 let currentStepLabel = "";
-/** 最近一次成功调用的输出规模（流式才有思考字符数），给耗时统计用 */
-let lastCallMeta = { out: 0, think: 0 };
+/** 最近一次成功调用的输出规模（流式才有思考字符数）和接口返回的 token 用量，给统计用 */
+let lastCallMeta: { out: number; think: number; usage?: any } = { out: 0, think: 0 };
+/** 网关不认 stream_options（用来要 usage）时记住，不再带（进程内） */
+let streamUsageBroken = false;
+/** 只提示一次：已经要求关闭思考，模型却仍在输出思考内容 */
+let warnedThinkingIgnored = false;
 
 /**
  * 流式请求：不再有"整个响应必须在 N 秒内完成"的限制，改为三道看门狗——
  *   首包超时（LLM_FIRST_TOKEN_MS）/ 数据流静默超时（LLM_IDLE_MS）/ 总时长上限（LLM_TOTAL_MS）。
  * 模型只要还在持续输出就不会超时；同时周期性打印"已收到多少字符、正在生成哪个工具调用"，终端不会看起来卡死。
  */
-async function completeStream(messages: Msg[], tools: OpenAI.Chat.Completions.ChatCompletionTool[], model: string, signal: AbortSignal | undefined, quiet: boolean): Promise<Completion> {
+async function completeStream(messages: Msg[], tools: OpenAI.Chat.Completions.ChatCompletionTool[], model: string, signal: AbortSignal | undefined, quiet: boolean, thinkCap = 0): Promise<Completion> {
   const ac = new AbortController();
+  const extra: any = extraBodyFor(model);
+  const thinkingRequestedOff = extra?.thinking?.type === "disabled" || extra?.enable_thinking === false;
+  let thinkOverrun = false;
+  let usage: any;
   const onAbort = () => ac.abort();
   if (signal?.aborted) ac.abort(); else signal?.addEventListener("abort", onAbort, { once: true });
 
@@ -377,7 +410,10 @@ async function completeStream(messages: Msg[], tools: OpenAI.Chat.Completions.Ch
 
   try {
     const stream = (await client.chat.completions.create(
-      { ...EXTRA_BODY, model, messages, tools, tool_choice: "auto", temperature: 0, stream: true } as any,
+      {
+        ...extra, model, messages, tools, tool_choice: "auto", temperature: 0, stream: true,
+        ...(streamUsageBroken ? {} : { stream_options: { include_usage: true } }),
+      } as any,
       { signal: ac.signal, timeout: LLM_FIRST_TOKEN_MS },
     )) as unknown as AsyncIterable<OpenAI.Chat.Completions.ChatCompletionChunk>;
 
@@ -388,13 +424,24 @@ async function completeStream(messages: Msg[], tools: OpenAI.Chat.Completions.Ch
     for await (const chunk of stream) {
       lastChunk = Date.now();
       seenFirst = true;
+      if ((chunk as any).usage) usage = (chunk as any).usage;
       const ch: any = chunk.choices?.[0];
       if (!ch) continue;
       const d = ch.delta ?? {};
       if (d.content) { content += d.content; received += d.content.length; }
       // 推理模型（GLM/DeepSeek-R1/Qwen3 等）会先流出一大段"思考"，它不属于答案但同样占时间
       const think = d.reasoning_content ?? d.reasoning;
-      if (typeof think === "string" && think) thinking += think.length;
+      if (typeof think === "string" && think) {
+        thinking += think.length;
+        if (thinkingRequestedOff && !warnedThinkingIgnored) {
+          warnedThinkingIgnored = true;
+          console.error(`[llm] ⚠ 已要求关闭思考，但模型仍在输出思考内容：网关/模型忽略了 thinking 参数。` +
+            `思考会消耗大量输出 token；已启用思考上限 AGENT_THINK_MAX_CHARS=${THINK_MAX_CHARS || "不限"}（超过则中止并重试）。` +
+            `请向网关确认关闭思考的参数名，或换用非推理模型（如 flash 以外的 chat 版本）。`);
+        }
+        // 还没产出任何答案/工具调用，思考就超过上限：不再等下去（中止连接 = 停止生成与计费），由 callLLM 带提示重试
+        if (thinkCap > 0 && received === 0 && thinking > thinkCap) { thinkOverrun = true; ac.abort(); break; }
+      }
       for (const t of d.tool_calls ?? []) {
         const i = t.index ?? 0;
         const cur = (calls[i] ??= { id: "", type: "function", function: { name: "", arguments: "" } });
@@ -408,6 +455,7 @@ async function completeStream(messages: Msg[], tools: OpenAI.Chat.Completions.Ch
     }
 
     // SDK 的流在被 abort 时是"静默结束"而不是抛错：必须在这里自己判断，否则被看门狗截断的半截回复会被当成完整答案
+    if (thinkOverrun) throw Object.assign(new Error(`思考超过上限（${thinking} 字符）`), { name: "ThinkOverrun", thinking });
     if (timeoutReason) throw Object.assign(new Error(`模型响应超时：${timeoutReason}`), { name: "APIConnectionTimeoutError" });
     if (!finish && calls.length) throw Object.assign(new Error("模型响应数据流意外中断（工具调用参数不完整）"), { name: "APIConnectionError" });
 
@@ -415,7 +463,7 @@ async function completeStream(messages: Msg[], tools: OpenAI.Chat.Completions.Ch
     if (!content && !toolCalls.length && !finish) throw Object.assign(new Error("模型返回了空数据流"), { status: 502 });
 
     const dt = Date.now() - t0;
-    lastCallMeta = { out: received, think: thinking };
+    lastCallMeta = { out: received, think: thinking, usage };
     if (!quiet && dt > 20_000) console.log(`（本次模型调用用时 ${fmtSecs(dt)}，输出 ${received} 字符${thinking ? `，思考 ${thinking} 字符` : ""}）`);
 
     return {
@@ -444,29 +492,58 @@ async function callLLM(
 ): Promise<LlmOutcome> {
   let overflowHandled = false;
   let timeouts = 0;
+  /** 思考超限后的那一次重试：带一条临时提示（不写进历史），且不再设思考上限 */
+  let nudge = false;
 
   for (let attempt = 0; ; attempt++) {
     if (signal?.aborted) return { ok: false, error: "已中断", aborted: true };
     const callStart = Date.now();
     try {
       lastCallMeta = { out: 0, think: 0 };
+      const reqMessages: Msg[] = nudge
+        ? [...messages, { role: "user", content: "[系统] 上一次尝试因思考过长被中止。这一步请不要长时间思考：直接调用最合适的工具，或直接给出结论。" }]
+        : messages;
       const resp = streamingBroken
-        ? await completeOnce(messages, tools, model, signal, quiet)
-        : await completeStream(messages, tools, model, signal, quiet);
+        ? await completeOnce(reqMessages, tools, model, signal, quiet)
+        : await completeStream(reqMessages, tools, model, signal, quiet, nudge ? 0 : THINK_MAX_CHARS);
       if (!resp.choices?.[0]?.message) throw Object.assign(new Error("模型返回了空 choices"), { status: 502 });
       const m: any = resp.choices[0].message;
       const outChars = lastCallMeta.out || ((m.content?.length ?? 0) + (m.tool_calls ?? []).reduce((s: number, t: any) => s + (t.function?.arguments?.length ?? 0), 0));
       // 子 Agent（quiet）的调用也算：它们确实占用了时间
       stats().llm(Date.now() - callStart, messages.reduce((s, x) => s + msgSize(x), 0), outChars, lastCallMeta.think);
+      stats().usage(lastCallMeta.usage);
       return { ok: true, resp };
     } catch (e: any) {
       if (signal?.aborted) return { ok: false, error: "已中断", aborted: true };
+
+      // 思考超过上限：这次生成已被中止。带"别长时间思考"的提示重试一次（不算失败次数；重试那次不设上限，所以最多浪费一次）
+      if (e?.name === "ThinkOverrun" && !nudge) {
+        nudge = true;
+        stats().thinkAborts++;
+        console.error(`[llm] ${currentStepLabel}：思考超过 ${THINK_MAX_CHARS} 字符仍无输出，已中止并带提示重试（调整：AGENT_THINK_MAX_CHARS）`);
+        attempt--;
+        continue;
+      }
+
+      // 网关不认 stream_options：不再要 usage，立刻重试（不算失败次数）
+      if (!streamUsageBroken && (e?.status === 400 || e?.status === 422) && /stream_options|include_usage/i.test(String(e?.message ?? ""))) {
+        streamUsageBroken = true;
+        attempt--;
+        continue;
+      }
       const info = classifyLlmError(e);
 
       // 网关不支持 stream：降级为一次性响应后立刻重试（不算失败次数）
       if (!streamingBroken && (e?.status === 400 || e?.status === 404 || e?.status === 422 || e?.status === 501) && /stream/i.test(String(e?.message ?? ""))) {
         streamingBroken = true;
         console.error(`[llm] 接口不支持流式响应，已改用一次性响应（长输出更容易超时；可调大 AGENT_LLM_TIMEOUT_MS）`);
+        attempt--;
+        continue;
+      }
+
+      // 接口不认我们自动附加的 thinking 字段：去掉它后立刻重试（不算失败次数）
+      if (autoThinkingOff(model) && (e?.status === 400 || e?.status === 422) && /thinking/i.test(String(e?.message ?? "")) && disableAutoThinking()) {
+        console.error(`[llm] 接口不支持 thinking 参数，已停止自动关闭思考（可用 AGENT_EXTRA_BODY 按网关要求自行设置）`);
         attempt--;
         continue;
       }
@@ -569,6 +646,7 @@ export async function runAgent(userContent: string, context: string, opts: Agent
       if (signal?.aborted) return result("aborted", lastText || "已中断");
 
       foldOldWrites(messages);
+      foldOldToolOutputs(messages);
       compactMessages(messages);
       if (messages[0]?.role === "system") messages[0] = makeSys();
       currentStepLabel = `步骤 ${step}`;

@@ -41,7 +41,9 @@ function describe(res: FixResult): string {
       return `${answer}\n⚠️  已完成修改，但【未能自动验证】（详见 warnings）${files}\n（可输入 /undo 撤销）\n${res.log}`;
     case "no_change":
       // 最常见的是纯问答/分析回合：答案就是结果，不需要任何"没有修改"的噪音
-      return `${answer}${res.warnings.length ? `\n[warnings]\n- ${res.warnings.join("\n- ")}` : ""}`;
+      return `${answer}` +
+        (res.produced.length ? `\n（运行期间项目里新增/变化的文件，可能来自脚本或后台任务：\n  ${res.produced.slice(0, 10).join("\n  ")}${res.produced.length > 10 ? `\n  …共 ${res.produced.length} 个` : ""}）` : "") +
+        (res.warnings.length ? `\n[warnings]\n- ${res.warnings.join("\n- ")}` : "");
     case "aborted":
       return `${answer}\n⏹  已中断，当前改动已保留${files}\n（输入 /undo 可撤销）\n${res.log}`;
     case "failed":

@@ -56,12 +56,12 @@ async function buildBaseContext(root: string, model?: string): Promise<string> {
         `语言：${m.lang}`,
         "可用验证命令（按优先级，exit 0 = 通过）：",
         ...m.verifyCommands.map((c, i) => `${i + 1}. ${c}`),
-        "规则：每次修改代码后，必须用 run_command 执行上述命令之一，并把原始输出作为下一步输入。" + rejected,
+        "规则：每次【修改代码】后，必须用 run_command 执行上述命令之一，并把原始输出作为下一步输入（纯提问/解释/给命令不需要）。" + rejected,
       ].join("\n")
     : [
         "## 本项目验证环境",
         `语言：${m.lang}（未发现可用验证命令）${rejected}`,
-        "请先用 list_files / search_code 找出测试脚本或构建配置，确定验证方法后再修改代码；",
+        "（仅当你要修改代码时）请先用 list_files / search_code 找出测试脚本或构建配置，确定验证方法后再修改；纯提问不需要找验证方法（读文件弄懂问题仍然需要）；",
         "如果确实无法验证，请在最终总结里明确写出“未验证”及原因。",
       ].join("\n");
 

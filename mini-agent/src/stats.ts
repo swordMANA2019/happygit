@@ -21,6 +21,14 @@ class RunStats {
   sentChars = 0;
   outChars = 0;
   thinkChars = 0;
+  /** 接口返回的真实 token 用量（网关不返回 usage 时全为 0） */
+  usageCalls = 0;
+  promptTokens = 0;
+  cachedTokens = 0;
+  completionTokens = 0;
+  reasoningTokens = 0;
+  /** 因思考超限而中止重来的次数 */
+  thinkAborts = 0;
   readonly tools = new Map<string, { n: number; ms: number }>();
 
   /** 切换阶段，返回之前的阶段（方便"临时切过去、做完切回来"） */
@@ -40,6 +48,15 @@ class RunStats {
     this.sentChars += sent;
     this.outChars += out;
     this.thinkChars += think;
+  }
+
+  usage(u: any) {
+    if (!u || typeof u.prompt_tokens !== "number") return;
+    this.usageCalls++;
+    this.promptTokens += u.prompt_tokens ?? 0;
+    this.completionTokens += u.completion_tokens ?? 0;
+    this.cachedTokens += u.prompt_tokens_details?.cached_tokens ?? 0;
+    this.reasoningTokens += u.completion_tokens_details?.reasoning_tokens ?? 0;
   }
 
   tool(name: string, ms: number) {
@@ -63,6 +80,17 @@ class RunStats {
         `平均每次发送约 ${Math.round(this.sentChars / this.llmCalls / 1000)}k 字符，平均输出约 ${Math.round(this.outChars / this.llmCalls)} 字符` +
         (this.thinkChars ? `，思考共 ${Math.round(this.thinkChars / 1000)}k 字符` : ""),
       );
+    }
+    if (this.usageCalls) {
+      const k = (n: number) => (n >= 10000 ? `${Math.round(n / 1000)}k` : String(n));
+      lines.push(
+        `  Token（接口返回）：输入 ${k(this.promptTokens)}${this.cachedTokens ? `（缓存命中 ${k(this.cachedTokens)}）` : ""}，` +
+        `输出 ${k(this.completionTokens)}${this.reasoningTokens ? `（其中思考 ${k(this.reasoningTokens)}）` : ""}；` +
+        `平均每次输入 ${k(Math.round(this.promptTokens / this.usageCalls))}` +
+        (this.thinkAborts ? `；思考超限中止 ${this.thinkAborts} 次` : ""),
+      );
+    } else if (this.thinkAborts) {
+      lines.push(`  思考超限中止 ${this.thinkAborts} 次`);
     }
     const toolMs = [...this.tools.values()].reduce((s, t) => s + t.ms, 0);
     if (this.tools.size) {

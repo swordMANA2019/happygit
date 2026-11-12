@@ -1,7 +1,8 @@
 import fs from "node:fs/promises";
 import path from "node:path";
+import type OpenAI from "openai";
 import { client } from "./llm.js";
-import { MODEL, MANIFEST_TTL_MS } from "./config.js";
+import { MODEL, MANIFEST_TTL_MS, extraBodyFor } from "./config.js";
 import { execCommand } from "./tools/shell.js";
 
 // npx 一律加 --no-install：本地没装就应判定"不可用"，而不是在探测阶段去联网下载
@@ -90,8 +91,8 @@ async function buildRubric(root: string, lang: string, model: string): Promise<s
 ${tree}
 输出纯 JSON 数组：[{"text":"...","command":"..."}]，不要有其他文字。至少包含一条编译/类型检查、一条测试、一条产物存在性检查。`;
     const resp = await client.chat.completions.create({
-      model, messages: [{ role: "user", content: prompt }], temperature: 0,
-    }, { timeout: 30_000 });
+      ...extraBodyFor(model), model, messages: [{ role: "user", content: prompt }], temperature: 0,
+    } as any, { timeout: 30_000 }) as OpenAI.Chat.Completions.ChatCompletion;
     const arr = parseJsonArray(resp.choices[0].message.content ?? "[]");
     return arr.map((x) => `- [ ] ${String(x.text)}  →  \`${x.command}\``).join("\n");
   } catch {

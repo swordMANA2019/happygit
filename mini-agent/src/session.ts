@@ -11,7 +11,7 @@ import type { ApproveFn } from "./tools/ctx.js";
 import type { Workspace } from "./workspace.js";
 import { MODEL } from "./config.js";
 import {
-  type Msg, addNote, compactConversation, saveConversation, loadConversation, clearConversation,
+  type Msg, addNote, BackgroundCompactor, saveConversation, loadConversation, clearConversation,
 } from "./memory.js";
 import { buildDiffs, type FileDiff } from "./ui/diffview.js";
 import { JobManager } from "./tools/jobs.js";
@@ -48,6 +48,8 @@ export class Session {
 
   private _cwd: string;
   private controller: AbortController | null = null;
+  /** 历史摘要：回合结束后在后台预先做好，下一回合开始时直接套用 */
+  private readonly compactor = new BackgroundCompactor();
 
   constructor(cwd: string, model: string = MODEL, public prompter: Prompter | null = null) {
     this._cwd = path.resolve(cwd);
@@ -67,6 +69,7 @@ export class Session {
     try { ok = fs.statSync(next).isDirectory(); } catch { /* 下面统一报错 */ }
     if (!ok) throw new Error(`不是有效目录：${next}`);
     this._cwd = next;
+    this.compactor.cancel();
     this.messages.length = 0;
     resetState(this.state);
     this.lastWorkspace = null;
@@ -87,12 +90,14 @@ export class Session {
     const c = new AbortController();
     this.controller = c;
     try {
-      // 每个回合开始前：历史太长就先压缩较早的回合（保留最近几个回合的原文）
-      await compactConversation(this.messages, this.model, c.signal);
+      // 每个回合开始前：套用后台已做好的历史摘要（没好就等；历史仍然太长则现场压缩）
+      await this.compactor.settle(this.messages, this.model, c.signal);
       return await fn(c.signal);
     } finally {
       this.controller = null;
       void saveConversation(this._cwd, this.messages, this.state);   // 落盘，下次启动可 /resume
+      // 用户读结果/打字的空档里，后台把较早的历史摘要好（不阻塞、下一回合直接用）
+      this.compactor.schedule(this.messages, this.model);
     }
   }
 
@@ -190,6 +195,7 @@ export class Session {
   async resume(): Promise<number> {
     const saved = await loadConversation(this._cwd);
     if (!saved) return 0;
+    this.compactor.cancel();
     this.messages.length = 0;
     this.messages.push(...saved.messages);
     loadState(this.state, saved.state);
@@ -226,6 +232,7 @@ export class Session {
 
   /** 退出前清理：终止后台任务、关闭外部工具进程 */
   dispose() {
+    this.compactor.cancel();
     this.jobs.killAll();
     this.mcp.closeAll();
   }
@@ -240,6 +247,7 @@ export class Session {
 
   /** 清空对话、计划与笔记（包括磁盘上的落盘） */
   async resetHistory(): Promise<void> {
+    this.compactor.cancel();
     this.messages.length = 0;
     resetState(this.state);
     await clearConversation(this._cwd);

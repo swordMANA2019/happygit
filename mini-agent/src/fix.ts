@@ -311,6 +311,13 @@ export async function runFixTask(task: string, rootDir: string, opts: FixOpts = 
        *    只产出了文件（如脚本生成的 pptx）而没改代码时，跑项目测试没有意义，只跑技能验证器。 -- */
       const dyn = await skillVerifiers(skills, usedSkills, [...changedNow, ...produced]);
       if (dyn.length) hasDynamicVerifier = true;
+
+      /* -- 统一入口下没改任何文件、也没有技能验证器要跑：这是一次问答/查看回合，不进验证/评审/"未验证"流程。
+       *    （snapshot 里的"产出文件"可能只是上一回合起的后台训练还在写日志/checkpoint、或 __pycache__，
+       *      不能因此把一句提问当成"已完成修改但未能验证"）。产出文件仍会随结果展示。 -- */
+      if (opts.deferBaseline && changedNow.length === 0 && dyn.length === 0) {
+        return finish("no_change");
+      }
       const toRun = changedNow.length > 0 || !opts.deferBaseline ? [...cmds, ...dyn] : dyn;
 
       /* -- 验证：只有 kind=code 的失败才算"代码没改对" -- */
@@ -374,7 +381,7 @@ export async function runFixTask(task: string, rootDir: string, opts: FixOpts = 
       /* -- 没有任何自动验证器通过：不能就此宣布"完成"。让模型亲自黑盒自测（真的跑起来看），并用硬证据约束它 -- */
       if (selfTestWillRun) {
         // 快速通道：模型在最后一次改动【之后】自己已经真正运行过有意义的命令（不是 cat/ls），且最后一条成功——
-        // 并且它的最终回复里已有"验证"一节（规则 18）。再开一整轮自测只是把同样的事重做一遍。
+        // 并且它的最终回复里已有"验证"一节（规则 17）。再开一整轮自测只是把同样的事重做一遍。
         if (r.status === "done" && r.evidence.runs > 0 && r.evidence.lastOk === true && /验证/.test(r.text)) {
           const cmdShown = r.evidence.lastCmd.length > 100 ? `${r.evidence.lastCmd.slice(0, 100)} …` : r.evidence.lastCmd;
           console.log(`\n✅ 模型在改完之后已自行运行验证（${r.evidence.runs} 条命令，最后一条成功），跳过单独的自测轮`);
