@@ -104,6 +104,14 @@ export function extraBodyFor(model: string): Record<string, unknown> {
  */
 export const THINK_MAX_CHARS = Number(process.env.AGENT_THINK_MAX_CHARS ?? 6000);
 
+/* ---- PowerPoint 原生控制 / 视觉 / 本地素材 ---- */
+/** AGENT_PPT：0 = 关闭；1 = 强制开启；不设 = 自动检测（Windows + 桌面版 PowerPoint） */
+export const PPT_ENABLED = process.env.AGENT_PPT ?? "";
+/** 视觉模型（可选）：ppt_look 把幻灯片截图发给它，拿回文字评价；主模型不支持图片时用它 */
+export const VISION_MODEL = process.env.AGENT_VISION_MODEL || "";
+/** 本地素材库目录（可多个，用 ; 分隔）；默认 <项目>/assets 与 <项目>/.agent/assets */
+export const ASSETS_DIRS = process.env.AGENT_ASSETS_DIR ?? "";
+
 /** 历史摘要：单次摘要最多生成多少 token（限制输出长度 = 限制耗时） */
 export const SUMMARY_MAX_TOKENS = Number(process.env.AGENT_SUMMARY_MAX_TOKENS ?? 1200);
 /** 摘要专用模型（可选）：用更快/更便宜的模型做压缩，默认沿用会话模型 */

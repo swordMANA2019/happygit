@@ -149,6 +149,23 @@ LLM 超时与"看起来卡死"：
 - 子任务：delegate 起只读子 Agent（深度受限、最多并行 3 个），适合并行读多份资料。
 - 可选视觉检查：AGENT_VISION=1 时 view_image 可看渲染后的图片。其它环境变量：AGENT_MCP_TIMEOUT_MS、AGENT_MCP_START_TIMEOUT_MS。
 
+PowerPoint 原生控制（仅 Windows + 桌面版 PowerPoint；不用 python-pptx）：
+- 原理：常驻一个 PowerShell 进程（src/office/ppt-bridge.ps1）通过 COM 直接操作你**正打开**的演示文稿，读写都是实时的；
+  不改文件、不自动保存；每个会话第一次修改前用 SaveCopyAs 备份到 .agent/backups/ppt/，PowerPoint 里 Ctrl+Z 可撤销。
+- 触发：对话里提到 PPT/幻灯片/PowerPoint/slide 才会启用 7 个工具并追加说明（约 1.5k token；没碰 PPT 的会话零开销）。
+  工具：ppt_read（实时状态+用户选中的形状+主题）、ppt_edit（批量操作：文本框/形状/线/图片/格式/对齐/分组/页面…）、
+  ppt_lint（规则检查，可 fix=true 自动修）、ppt_look（渲染成图交给视觉模型点评）、asset_search（本地素材）、ppt_open、ppt_save。
+  ask 模式只有只读的 4 个；子 Agent 没有。
+- 命令：/ppt 状态 | /ppt review 只评审不修改 | /watch ppt [off] 你手动编辑停手 3 秒后按规则检查当前页，只提示新问题（不花 token）
+  | /apply [编号] 直接执行规则给出的机械修复（不经过模型）。
+- 素材：AGENT_ASSETS_DIR=目录1;目录2（默认 <项目>/assets 与 <项目>/.agent/assets）。可在目录里放 index.json
+  （[{"file":"flowers/rose.png","tags":["flower","花"],"description":"…","license":"CC0"}]）；不放则按文件名/文件夹名搜。找不到时模型会用基本形状组合绘制，不会联网下载或编造路径。
+- 视觉点评：AGENT_VISION_MODEL=<支持图片的模型名>（走同一个 OPENAI_BASE_URL；点评由它完成，主模型不必支持图片）；
+  或 AGENT_VISION=1 让主模型自己看图。都没配时 ppt_look 会明确告知不可用，模型只能依赖规则检查。
+- 开关：AGENT_PPT=0 关闭，AGENT_PPT=1 强制开启（默认检测注册表里是否有 PowerPoint.Application）。
+  监视间隔：AGENT_WATCH_POLL_MS（默认 1500）、AGENT_WATCH_DEBOUNCE_MS（默认 3000）。
+- 用 bun 打成单文件时，把 src/office/ppt-bridge.ps1 放在可执行文件同目录即可（脚本保持 ASCII，Windows PowerShell 5.1 才能正确读取）。
+
 打包工具：
 # 装 bun（一次）
 curl -fsSL https://bun.sh/install | bash

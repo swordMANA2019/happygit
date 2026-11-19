@@ -14,6 +14,7 @@ import type { FailureKind } from "./errors.js";
 import type { TaskState } from "./taskstate.js";
 import type { JobManager } from "./tools/jobs.js";
 import type { McpManager } from "./mcp.js";
+import type { PptBridge } from "./office/ppt.js";
 import { snapshotTree, producedFiles } from "./snapshot.js";
 import { resetStats, stats } from "./stats.js";
 import { discoverSkills, skillVerifiers, type Skill } from "./skills.js";
@@ -115,6 +116,8 @@ export type FixOpts = {
   /** 后台任务管理器 / 外部工具（MCP）/ 技能清单等：由 Session 持有并传入 */
   jobs?: JobManager;
   mcp?: McpManager;
+  /** PowerPoint 桥接（传了就给模型 PPT 工具） */
+  ppt?: PptBridge;
   /** 拼进系统提示的额外段落（技能清单、MCP 说明） */
   extraContext?: string;
 };
@@ -285,7 +288,7 @@ export async function runFixTask(task: string, rootDir: string, opts: FixOpts = 
       const r = await runAgent(prompt, ctx, {
         root, sessionId, model, mode: "agent", workspace: ws, signal, messages: convo,
         task, approve: opts.approve, approved, beforeWrite, state: opts.state,
-        jobs: opts.jobs, mcp: opts.mcp, usedSkills,
+        jobs: opts.jobs, mcp: opts.mcp, ppt: opts.ppt, usedSkills,
         extraRoots: opts.extraRoots, askExternal: opts.askExternal,
       });
       if (r.text) lastAnswer = r.text;
@@ -394,7 +397,7 @@ export async function runFixTask(task: string, rootDir: string, opts: FixOpts = 
         const st = await runAgent(SELFTEST_PROMPT, ctx, {
           root, sessionId, model, mode: "agent", workspace: ws, signal, messages: convo, maxSteps: 15,
           task, approve: opts.approve, approved, state: opts.state,
-          jobs: opts.jobs, mcp: opts.mcp, usedSkills,
+          jobs: opts.jobs, mcp: opts.mcp, ppt: opts.ppt, usedSkills,
           extraRoots: opts.extraRoots, askExternal: opts.askExternal,
         });
         // 自测这一轮的最后回复就是最终报告（含"验证"一节）；结论行是给程序看的，展示时去掉

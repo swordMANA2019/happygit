@@ -2,7 +2,10 @@ import readline from "node:readline/promises";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { stdin, stdout } from "node:process";
-import { MODEL, ALWAYS_STATS } from "./config.js";
+import { MODEL, ALWAYS_STATS, VISION_MODEL } from "./config.js";
+import { pptAvailable } from "./office/ppt.js";
+import { PptWatcher } from "./office/watch.js";
+import { pptErr } from "./tools/ppt.js";
 import { Session, type Prompter } from "./session.js";
 import type { FixResult, FixOpts } from "./fix.js";
 import {
@@ -25,6 +28,37 @@ function printBanner(ses: Session) {
   console.log(`Mini Agent | 模型：${ses.model} | 目录：${ses.cwd} | session：${ses.sessionId}`);
   console.log("直接输入即可（Agent 模式：自行判断回答或修改）。命令：/ask <问题> 只读问答 | /fix <任务> | /edit <任务> | /diag <任务> | /undo | /diff [编号|html|ide] 高亮查看改动");
   console.log("      /plan 计划与笔记 | /jobs 后台任务 | /skills 技能 | /mcp [reload] 外部工具 | /resume 恢复上次对话 | /reset 清空对话 | /probe | /context | /cd <目录> | /pwd | /model <名> | /exit   （任务运行中 Ctrl+C 可中断）");
+  if (pptAvailable()) console.log("      PowerPoint：直接说“把这页的标题放大/插一朵花”即可操作你正打开的 PPT | /ppt 状态 | /ppt review 评审当前页 | /watch ppt [off] 实时建议 | /apply [编号] 执行自动修复");
+}
+
+/* ---- PowerPoint：/ppt /watch /apply ---- */
+
+async function handlePpt(ses: Session, arg: string): Promise<void> {
+  if (!pptAvailable()) { console.log("PowerPoint 控制不可用：需要 Windows + 桌面版 PowerPoint（AGENT_PPT=0 会关闭，AGENT_PPT=1 强制开启）。"); return; }
+  if (arg === "review") {
+    ses.armPpt();
+    await handle(ses, "/ask 请评审我在 PowerPoint 里当前正看着的这一页：先 ppt_read 读取实时内容，再 ppt_lint，若 ppt_look 可用也看一眼渲染图；然后按优先级给出最多 5 条具体建议（指明形状和改法）。不要修改任何内容，等我确认后再改。");
+    return;
+  }
+  try {
+    const st = await ses.ppt.state();
+    if (!st.running) { console.log("PowerPoint 没有运行。直接对我说“新建一个关于…的 PPT”，或先手动打开一个文稿。"); return; }
+    if (!st.active) { console.log("PowerPoint 已运行，但没有打开的演示文稿。"); return; }
+    const sel = st.selection;
+    console.log(`文稿：${st.active}${st.saved ? "" : "（有未保存修改）"} | 共 ${st.slideCount} 页 | 当前第 ${st.activeSlide} 页 | ${st.slideWidth}x${st.slideHeight}pt` +
+      `\n选中：${!sel || sel.type === "none" ? "无" : sel.type === "shapes" ? sel.shapes?.map((s) => s.name).join("、") : sel.type === "slides" ? `缩略图第 ${sel.slides?.join("、")} 页` : "一段文字"}` +
+      `\n视觉点评：${VISION_MODEL ? `${VISION_MODEL}（ppt_look）` : process.env.AGENT_VISION === "1" ? "主模型看图（AGENT_VISION=1）" : "未配置（设置 AGENT_VISION_MODEL 后 ppt_look 才可用）"}`);
+  } catch (e: any) { console.log(`[PowerPoint] ${e?.message ?? e}`); }
+}
+
+async function handleWatch(ses: Session, watcher: PptWatcher, arg: string): Promise<void> {
+  if (!pptAvailable()) { console.log("PowerPoint 控制不可用（需要 Windows + 桌面版 PowerPoint）。"); return; }
+  const a = arg.replace(/^ppt\b\s*/i, "").trim().toLowerCase();
+  if (a === "off" || a === "stop") { watcher.stop(); console.log("已停止监视 PowerPoint。"); return; }
+  if (a === "" && watcher.running) { console.log("正在监视 PowerPoint（/watch ppt off 停止）。"); return; }
+  ses.armPpt();
+  watcher.start();
+  console.log("已开始监视 PowerPoint：你在 PowerPoint 里改动并停手约 3 秒后，我会按规则检查当前页（出界/重叠/字号/对比度/溢出/对齐…，不花 token）并只提示新问题。\n/apply 执行自动修复，/ppt review 让我整体评审，/watch ppt off 停止。");
 }
 
 function describe(res: FixResult): string {
@@ -193,6 +227,10 @@ async function main() {
     ? { ask: async (q, signal) => { try { return await rl.question(q, { signal }); } catch { return ""; } } }
     : null;
   const ses = new Session(process.cwd(), MODEL, prompter);
+  const watcher = new PptWatcher({
+    ppt: ses.ppt, cwd: () => ses.cwd, busy: () => ses.busy,
+    print: (s) => { process.stdout.write(`${s}\n\n你> `); },   // 提示打在用户正在输入的提示符下面，补打一个提示符
+  });
 
   // CLI 单次调用：走和 REPL 同一条路径，保证有检查点/验证/回滚
   if (argTask) {
@@ -248,6 +286,15 @@ async function main() {
         catch (e: any) { console.log(e.message); }
         continue;
       }
+      if (input === "/ppt" || input.startsWith("/ppt ")) {
+        try { await handlePpt(ses, input.slice(4).trim().toLowerCase()); } catch (e: any) { console.error(`\n[错误] ${e?.message ?? e}`); }
+        continue;
+      }
+      if (input === "/watch" || input.startsWith("/watch ")) { await handleWatch(ses, watcher, input.slice(6).trim()); continue; }
+      if (input === "/apply" || input.startsWith("/apply ")) {
+        try { console.log(await watcher.apply(input.slice(6))); } catch (e: any) { console.log(pptErr(e)); }
+        continue;
+      }
       if (input === "/diff" || input.startsWith("/diff ")) { await handleDiff(ses, input.slice(5)); continue; }
       if (input === "/undo") {
         const files = await ses.undo();
@@ -264,6 +311,7 @@ async function main() {
       }
     }
   } finally {
+    watcher.stop();
     ses.dispose();
     rl!.close();
   }

@@ -5,6 +5,7 @@ import type { AgentMode } from "../llm.js";
 import type { TaskState } from "../taskstate.js";
 import type { JobManager } from "./jobs.js";
 import type { McpManager } from "../mcp.js";
+import type { PptBridge } from "../office/ppt.js";
 
 export type ApproveFn = (ops: FileOp[]) => Promise<Approval>;
 
@@ -37,6 +38,8 @@ export type ToolCtx = {
   jobs: JobManager;
   /** 外部工具（MCP）；没有配置则为空 */
   mcp?: McpManager;
+  /** PowerPoint 原生控制（仅 Windows + 桌面版 PowerPoint，且本会话已启用 PPT 工具时才有） */
+  ppt?: PptBridge;
   /** 本次任务中加载过的技能（用于完成后执行技能声明的验证） */
   usedSkills: Set<string>;
   /** view_image 排队等待附加到下一条消息的图片 */

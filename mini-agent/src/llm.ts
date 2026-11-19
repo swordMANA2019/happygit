@@ -126,6 +126,60 @@ export const VIEW_IMAGE_TOOL: Tool = { type: "function", function: {
   description: "查看一张图片（png/jpg/webp/gif），用于检查渲染结果，例如把幻灯片渲染成图后看版式是否正常。图片会在下一条消息里出现。",
   parameters: { type: "object", properties: { path: { type: "string" } }, required: ["path"] } } };
 
+/**
+ * PowerPoint 原生控制工具（Windows + 桌面版 PowerPoint）。不放进 TOOLS：没触及 PPT 的会话不付这些 schema 的 token。
+ * 只读的（ppt_read / ppt_look / asset_search / 不带 fix 的 ppt_lint）在 ask 模式也可用。
+ */
+export const PPT_READ_NAMES = ["ppt_read", "ppt_lint", "ppt_look", "asset_search"] as const;
+export const PPT_TOOLS: Tool[] = [
+  { type: "function", function: {
+      name: "ppt_read",
+      description: "读取用户正在 PowerPoint 里打开的演示文稿的实时状态：文稿名、页数、用户当前看的页、用户当前选中了什么，以及该页每个形状的类型/位置/大小/文字/字体/颜色/填充，另含大纲和主题色/字体。任何修改前先调用。slide 省略 = 用户当前页。",
+      parameters: { type: "object", properties: {
+        slide: { type: "number", description: "页码（1-based），默认用户当前页" },
+      } } } },
+  { type: "function", function: {
+      name: "ppt_edit",
+      description: `批量修改当前活动演示文稿（实时生效，用户可 Ctrl+Z 撤销；首次修改前自动备份）。坐标单位 pt，画布左上角为原点（16:9 = 960x540）；颜色 RRGGBB。ops 按顺序执行，某个失败则停在那里（已执行的不回滚）。
+每个 op 形如 {"op":名,"slide":页码(省略=用户当前页),...}；shape 字段写名字或 id（"selection"=用户选中的形状）；add_* 可带 name 给新形状起名供后续引用。
+- add_textbox{text,left,top,width,height} / add_shape{shape,left,top,width,height,rotation?,text?} / add_line{x1,y1,x2,y2,color,weight} / add_picture{path,left,top,width?,height?,alt?}
+  shape 取值：rectangle rounded_rectangle oval circle triangle right_triangle diamond hexagon octagon pentagon parallelogram trapezoid cross star heart sun moon cloud teardrop lightning smiley donut can cube chevron homeplate callout right_arrow left_arrow up_arrow down_arrow
+- 格式字段（add_* 和 format 通用）：font size bold italic color align(left|center|right|justify) valign(top|middle|bottom) fill(RRGGBB|none) line(RRGGBB|none) line_width transparency(0-1) alt autosize wrap
+- set_text{shape,text} / format{shape,...格式字段} / geometry{shape,left,top,width,height,rotation} / z_order{shape,action:front|back|forward|backward} / delete_shape{shape} / group{shapes:[...],name} / align{shapes,mode:left|center|right|top|middle|bottom,relative_to:slide|shapes} / distribute{shapes(≥3),direction:horizontal|vertical}
+- add_slide{layout:title|title_content|title_only|blank|版式名,index?} / duplicate_slide / delete_slide / move_slide{to} / set_notes{text} / set_background{color}
+- goto_slide{slide,shape?}：让 PowerPoint 窗口显示某页（shape 可选，放大视图时滚动到该形状）。改完后窗口会自动切到最后被改动的那一页，通常不必手动调用。`,
+      parameters: { type: "object", properties: {
+        ops: { type: "array", description: "操作列表（一次最多 40 个），能合并成一批就不要拆成多次调用", items: { type: "object" } },
+      }, required: ["ops"] } } },
+  { type: "function", function: {
+      name: "ppt_lint",
+      description: "对幻灯片做规则检查（不花 token）：出界、重叠、字号过小、文字对比度不足、文字溢出、对齐差一点、文字过多、空占位符、字体过杂等。fix=true 会自动修复其中能机械修复的并返回剩余问题。slide 省略 = 用户当前页；all=true 检查全部页。",
+      parameters: { type: "object", properties: {
+        slide: { type: "number" }, all: { type: "boolean" }, fix: { type: "boolean", description: "自动修复可修复的问题（agent 模式）" },
+      } } } },
+  { type: "function", function: {
+      name: "ppt_look",
+      description: "把一页渲染成图片并交给视觉模型点评（版式层次、配色、留白、图文遮挡等规则检查发现不了的审美问题）。较慢、花钱：在完成一轮 ppt_edit 并通过 ppt_lint 之后再用，同一页最多看 2 次。可用 question 指定想问什么。",
+      parameters: { type: "object", properties: {
+        slide: { type: "number" }, question: { type: "string", description: "想让视觉模型重点看什么，省略 = 整体评价" },
+      } } } },
+  { type: "function", function: {
+      name: "asset_search",
+      description: "在本地素材库里按关键词找图片（花、图标、logo、背景……）。query 可同时写中英文同义词。返回完整路径，供 ppt_edit 的 add_picture 使用。不联网。没找到时用 add_shape 组合绘制，或如实告诉用户缺素材。",
+      parameters: { type: "object", properties: {
+        query: { type: "string" }, limit: { type: "number" },
+      }, required: ["query"] } } },
+  { type: "function", function: {
+      name: "ppt_open",
+      description: "新建空白演示文稿（不带 path），或打开项目内/用户点名的 .pptx 文件。用户没有打开任何文稿而要求做 PPT 时使用。",
+      parameters: { type: "object", properties: { path: { type: "string" } } } } },
+  { type: "function", function: {
+      name: "ppt_save",
+      description: "保存当前演示文稿。仅当用户明确要求保存/另存时调用；不要自动保存（用户的文件由用户决定何时保存）。带 path（项目内、.pptx）= 另存为。",
+      parameters: { type: "object", properties: { path: { type: "string" } } } } },
+];
+const PPT_READ_SET = new Set<string>(PPT_READ_NAMES);
+
 export type AgentMode = "ask" | "agent";
 
 /** 只读调查就能用的工具名（ask 模式 + 子 Agent） */
@@ -136,6 +190,8 @@ export type ToolsOpts = {
   extra?: Tool[];
   /** 子 Agent：只读，且不能再 delegate（防止无限递归） */
   sub?: boolean;
+  /** 启用 PowerPoint 工具（ask 模式只给只读那几个） */
+  ppt?: boolean;
 };
 
 /**
@@ -144,8 +200,12 @@ export type ToolsOpts = {
 export function toolsFor(mode: AgentMode, opts: ToolsOpts = {}): Tool[] {
   const vision = process.env.AGENT_VISION === "1" ? [VIEW_IMAGE_TOOL] : [];
   if (opts.sub) return [...TOOLS.filter((t) => READONLY_NAMES.has((t as any).function.name)), ...vision];
-  if (mode === "agent") return [...TOOLS, ...vision, ...(opts.extra ?? [])];
-  return [...TOOLS.filter((t) => READONLY_NAMES.has((t as any).function.name) || (t as any).function.name === "delegate"), ...vision];
+  if (mode === "agent") return [...TOOLS, ...vision, ...(opts.ppt ? PPT_TOOLS : []), ...(opts.extra ?? [])];
+  return [
+    ...TOOLS.filter((t) => READONLY_NAMES.has((t as any).function.name) || (t as any).function.name === "delegate"),
+    ...vision,
+    ...(opts.ppt ? PPT_TOOLS.filter((t) => PPT_READ_SET.has((t as any).function.name)) : []),
+  ];
 }
 
 const COMMON = `你是一个运行在本地工作目录中的智能助手 Agent，工作方式参考 Cursor。最擅长编程，也处理文档整理、资料分析、写作等以文件为载体的任务。

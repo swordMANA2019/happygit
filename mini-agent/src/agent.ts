@@ -1,7 +1,9 @@
 import OpenAI from "openai";
 import {
-  client, toolsFor, buildSystemPrompt, TOOLS, READ_TOOL_NAMES, WRITE_TOOL_NAMES, AGENT_ONLY_NAMES, type AgentMode,
+  client, toolsFor, buildSystemPrompt, TOOLS, PPT_TOOLS, READ_TOOL_NAMES, WRITE_TOOL_NAMES, AGENT_ONLY_NAMES, type AgentMode,
 } from "./llm.js";
+import { pptRead, pptEdit, pptLint, pptLook, assetSearch, pptOpen, pptSave } from "./tools/ppt.js";
+import type { PptBridge } from "./office/ppt.js";
 import { readFile, writeFile, editFile, deleteFile, listFiles } from "./tools/fs.js";
 import { searchCode } from "./tools/search.js";
 import { JobManager, runCommandJob, jobOutput, stopJob, listJobs } from "./tools/jobs.js";
@@ -75,6 +77,8 @@ export type AgentOpts = {
   jobs?: JobManager;
   /** 外部工具（MCP）；仅 agent 模式生效 */
   mcp?: McpManager;
+  /** PowerPoint 桥接（Session 持有）；传了才会给模型 PPT 工具。子 Agent 不用 */
+  ppt?: PptBridge;
   /** 本次任务用过的技能会被记在这里（fix 用它决定要跑哪些技能声明的验证） */
   usedSkills?: Set<string>;
   /** 子 Agent：只读、不能再 delegate、不向终端打印过程 */
@@ -101,6 +105,8 @@ async function withSubSlot<T>(fn: () => Promise<T>): Promise<T> {
 const READ_SET = new Set<string>(READ_TOOL_NAMES);
 const WRITE_SET = new Set<string>(WRITE_TOOL_NAMES);
 const AGENT_ONLY_SET = new Set<string>(AGENT_ONLY_NAMES);
+/** 会改动演示文稿/文件的 PPT 工具：ask 模式拒绝（ppt_lint 的 fix 在处理函数里单独拦） */
+const PPT_WRITE_SET = new Set<string>(["ppt_edit", "ppt_open", "ppt_save"]);
 /** 互不依赖、可以同一轮并发执行的调用：纯读 + 子 Agent */
 /** 只是"看一眼"的命令：不能算作"改完后验证过"的证据 */
 const TRIVIAL_CMD = /^\s*(cat|ls|dir|type|echo|pwd|cd|head|tail|wc|find|tree|which|where|get-content|get-childitem|git\s+(status|diff|log|show))\b/i;
@@ -110,7 +116,7 @@ const PARALLEL_SET = new Set<string>([...READ_TOOL_NAMES, "delegate"]);
 const POLLING_SET = new Set<string>(["job_output", "list_jobs"]);
 
 function validateArgs(name: string, args: any): string | null {
-  const def = TOOLS.find((t) => (t as any).function.name === name) as any;
+  const def = (TOOLS.find((t) => (t as any).function.name === name) ?? PPT_TOOLS.find((t) => (t as any).function.name === name)) as any;
   if (!def) return null;
   const schema = def.function.parameters;
   if (args === null || typeof args !== "object" || Array.isArray(args)) return "参数必须是 JSON 对象";
@@ -139,7 +145,7 @@ function explainFsError(name: string, args: any, e: any): string {
 }
 
 async function dispatch(name: string, args: any, ctx: ToolCtx): Promise<string> {
-  if (ctx.mode === "ask" && (WRITE_SET.has(name) || AGENT_ONLY_SET.has(name) || isMcpToolName(name))) {
+  if (ctx.mode === "ask" && (WRITE_SET.has(name) || AGENT_ONLY_SET.has(name) || PPT_WRITE_SET.has(name) || isMcpToolName(name))) {
     return "[已拒绝] 当前为只读模式，没有写文件/执行命令/调用外部工具的权限。";
   }
   const bad = validateArgs(name, args);
@@ -167,6 +173,13 @@ async function dispatch(name: string, args: any, ctx: ToolCtx): Promise<string> 
       case "search_code": return await searchCode(ctx.root, args.query, args.max_results ?? 40);
       case "read_document": return await readDocument(ctx, args.path, args.start_page, args.end_page);
       case "view_image":  return await loadImage(ctx, args.path);
+      case "ppt_read":    return await pptRead(ctx, args);
+      case "ppt_edit":    return await pptEdit(ctx, args);
+      case "ppt_lint":    return await pptLint(ctx, args);
+      case "ppt_look":    return await pptLook(ctx, args);
+      case "asset_search": return await assetSearch(ctx, args);
+      case "ppt_open":    return await pptOpen(ctx, args);
+      case "ppt_save":    return await pptSave(ctx, args);
       case "use_skill": {
         const { text, skill } = await loadSkillText(await discoverSkills(ctx.root), args.name);
         if (skill) ctx.usedSkills.add(skill.name);
@@ -622,17 +635,20 @@ export async function runAgent(userContent: string, context: string, opts: Agent
     model: opts.model,
     jobs: opts.jobs ?? defaultJobs(),
     mcp: opts.mcp,
+    ppt: opts.sub ? undefined : opts.ppt,
     usedSkills: opts.usedSkills ?? new Set<string>(),
     pendingImages: [],
     commandRuns: 0,
     depth: opts.sub ? 1 : 0,
   };
   const log: (...a: any[]) => void = opts.sub ? () => {} : console.log;
-  const tools = toolsFor(mode, { extra: mode === "agent" ? opts.mcp?.toolDefs() : undefined, sub: opts.sub });
+  const tools = toolsFor(mode, { extra: mode === "agent" ? opts.mcp?.toolDefs() : undefined, sub: opts.sub, ppt: !!ctx.ppt });
 
   let step = 0;
   let toolCalls = 0;
   let writes = 0;
+  /** 成功改动演示文稿的次数：改动前后"同样的 ppt_read / ppt_lint"结果不同，不能算原地打转 */
+  let pptEdits = 0;
   let emptyReplies = 0;
   let lastText = "";
   const seen = new Map<string, number>();
@@ -690,7 +706,7 @@ export async function runAgent(userContent: string, context: string, opts: Agent
 
         // 重复检测：同一调用（run_command 以"期间是否有过写入"区分）反复出现 = 在原地打转。
         // 轮询后台任务本来就要反复调用同一个 job_output，不算原地打转
-        const key = `${fn}:${JSON.stringify(args)}${fn === "run_command" ? `#w${writes}` : ""}`;
+        const key = `${fn}:${JSON.stringify(args)}${fn === "run_command" ? `#w${writes}` : fn.startsWith("ppt_") ? `#p${pptEdits}` : ""}`;
         const n = POLLING_SET.has(fn) ? 0 : (seen.get(key) ?? 0) + 1;
         if (!POLLING_SET.has(fn)) seen.set(key, n);
 
@@ -700,6 +716,9 @@ export async function runAgent(userContent: string, context: string, opts: Agent
         if (WRITE_SET.has(fn) && res.startsWith("已")) {
           writes++;
           evidence = { runs: 0, lastOk: null, lastCmd: "" };   // 改了文件：之前跑过的命令不再算数
+        }
+        if (PPT_WRITE_SET.has(fn) || (fn === "ppt_lint" && args.fix)) {
+          if (res.startsWith("已") || res.includes("已自动修复")) pptEdits++;   // 成功（含部分成功）才算改动
         }
         if (fn === "run_command" && !res.startsWith("[已拒绝]") && !TRIVIAL_CMD.test(String(args.command ?? ""))) {
           const failed = /^\[(命令失败|命令已被终止|工具错误|参数错误|已中断)/.test(res);
