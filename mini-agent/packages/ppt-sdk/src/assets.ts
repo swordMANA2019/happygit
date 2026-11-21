@@ -1,10 +1,10 @@
 import fs from "node:fs";
 import path from "node:path";
-import { ASSETS_DIRS } from "../config.js";
 
 /**
  * 本地素材库：模型说“插一朵花”时，不联网、不生成，而是在本地素材目录里按关键词找图。
- * 目录来源：AGENT_ASSETS_DIR（; 分隔，可多个），否则 <项目>/assets 与 <项目>/.agent/assets。
+ * 目录来源：调用方传入 dirs（数组，或用 ; 分隔的字符串，相对路径相对 root），不传则 <root>/assets。
+ * （SDK 不读环境变量；mini-agent 把 AGENT_ASSETS_DIR 传进来。）
  * 每个目录里可选放一个 index.json，给图片补充标签/描述/许可证（不放也能按文件名和文件夹名搜）：
  *   [{ "file": "flowers/rose.png", "tags": ["flower","rose","花","玫瑰"], "description": "红色玫瑰", "license": "CC0" }]
  *   或 { "flowers/rose.png": { "tags": [...], "description": "...", "license": "..." } }
@@ -17,11 +17,14 @@ const MAX_FILES = 5000;
 export type Asset = { path: string; rel: string; tags: string[]; description: string; license?: string; bytes: number };
 export type AssetHit = Asset & { score: number };
 
-export function assetDirs(root: string): string[] {
-  const dirs = ASSETS_DIRS
-    ? ASSETS_DIRS.split(";").map((s) => s.trim()).filter(Boolean).map((d) => path.resolve(root, d))
-    : [path.join(root, "assets"), path.join(root, ".agent", "assets")];
-  return dirs.filter((d) => { try { return fs.statSync(d).isDirectory(); } catch { return false; } });
+export type AssetDirsConfig = string | string[] | undefined;
+
+/** 解析并过滤出真实存在的素材目录 */
+export function assetDirs(root: string, configured?: AssetDirsConfig): string[] {
+  const list = Array.isArray(configured) ? configured : configured ? configured.split(";") : [];
+  const dirs = list.map((s) => s.trim()).filter(Boolean).map((d) => path.resolve(root, d));
+  const chosen = dirs.length ? dirs : [path.join(root, "assets")];
+  return chosen.filter((d) => { try { return fs.statSync(d).isDirectory(); } catch { return false; } });
 }
 
 type Meta = { tags?: string[]; description?: string; license?: string };
@@ -43,9 +46,9 @@ function readIndex(dir: string): Map<string, Meta> {
   return m;
 }
 
-export function scanAssets(root: string): Asset[] {
+export function scanAssets(root: string, configured?: AssetDirsConfig): Asset[] {
   const out: Asset[] = [];
-  for (const dir of assetDirs(root)) {
+  for (const dir of assetDirs(root, configured)) {
     const idx = readIndex(dir);
     const walk = (d: string, depth: number) => {
       if (out.length >= MAX_FILES || depth > 6) return;

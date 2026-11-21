@@ -1,5 +1,6 @@
 import OpenAI from "openai";
 import { LLM_TIMEOUT_MS } from "./config.js";
+import { PPT_TOOL_DEFS, PPT_READ_NAMES } from "@mini-agent/ppt-sdk";
 
 export const client = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
@@ -127,57 +128,12 @@ export const VIEW_IMAGE_TOOL: Tool = { type: "function", function: {
   parameters: { type: "object", properties: { path: { type: "string" } }, required: ["path"] } } };
 
 /**
- * PowerPoint 原生控制工具（Windows + 桌面版 PowerPoint）。不放进 TOOLS：没触及 PPT 的会话不付这些 schema 的 token。
+ * PowerPoint 原生控制工具的定义来自 @mini-agent/ppt-sdk（Windows + 桌面版 PowerPoint）。
+ * 不放进 TOOLS：没触及 PPT 的会话不付这些 schema 的 token。
  * 只读的（ppt_read / ppt_look / asset_search / 不带 fix 的 ppt_lint）在 ask 模式也可用。
  */
-export const PPT_READ_NAMES = ["ppt_read", "ppt_lint", "ppt_look", "asset_search"] as const;
-export const PPT_TOOLS: Tool[] = [
-  { type: "function", function: {
-      name: "ppt_read",
-      description: "读取用户正在 PowerPoint 里打开的演示文稿的实时状态：文稿名、页数、用户当前看的页、用户当前选中了什么，以及该页每个形状的类型/位置/大小/文字/字体/颜色/填充，另含大纲和主题色/字体。任何修改前先调用。slide 省略 = 用户当前页。",
-      parameters: { type: "object", properties: {
-        slide: { type: "number", description: "页码（1-based），默认用户当前页" },
-      } } } },
-  { type: "function", function: {
-      name: "ppt_edit",
-      description: `批量修改当前活动演示文稿（实时生效，用户可 Ctrl+Z 撤销；首次修改前自动备份）。坐标单位 pt，画布左上角为原点（16:9 = 960x540）；颜色 RRGGBB。ops 按顺序执行，某个失败则停在那里（已执行的不回滚）。
-每个 op 形如 {"op":名,"slide":页码(省略=用户当前页),...}；shape 字段写名字或 id（"selection"=用户选中的形状）；add_* 可带 name 给新形状起名供后续引用。
-- add_textbox{text,left,top,width,height} / add_shape{shape,left,top,width,height,rotation?,text?} / add_line{x1,y1,x2,y2,color,weight} / add_picture{path,left,top,width?,height?,alt?}
-  shape 取值：rectangle rounded_rectangle oval circle triangle right_triangle diamond hexagon octagon pentagon parallelogram trapezoid cross star heart sun moon cloud teardrop lightning smiley donut can cube chevron homeplate callout right_arrow left_arrow up_arrow down_arrow
-- 格式字段（add_* 和 format 通用）：font size bold italic color align(left|center|right|justify) valign(top|middle|bottom) fill(RRGGBB|none) line(RRGGBB|none) line_width transparency(0-1) alt autosize wrap
-- set_text{shape,text} / format{shape,...格式字段} / geometry{shape,left,top,width,height,rotation} / z_order{shape,action:front|back|forward|backward} / delete_shape{shape} / group{shapes:[...],name} / align{shapes,mode:left|center|right|top|middle|bottom,relative_to:slide|shapes} / distribute{shapes(≥3),direction:horizontal|vertical}
-- add_slide{layout:title|title_content|title_only|blank|版式名,index?} / duplicate_slide / delete_slide / move_slide{to} / set_notes{text} / set_background{color}
-- goto_slide{slide,shape?}：让 PowerPoint 窗口显示某页（shape 可选，放大视图时滚动到该形状）。改完后窗口会自动切到最后被改动的那一页，通常不必手动调用。`,
-      parameters: { type: "object", properties: {
-        ops: { type: "array", description: "操作列表（一次最多 40 个），能合并成一批就不要拆成多次调用", items: { type: "object" } },
-      }, required: ["ops"] } } },
-  { type: "function", function: {
-      name: "ppt_lint",
-      description: "对幻灯片做规则检查（不花 token）：出界、重叠、字号过小、文字对比度不足、文字溢出、对齐差一点、文字过多、空占位符、字体过杂等。fix=true 会自动修复其中能机械修复的并返回剩余问题。slide 省略 = 用户当前页；all=true 检查全部页。",
-      parameters: { type: "object", properties: {
-        slide: { type: "number" }, all: { type: "boolean" }, fix: { type: "boolean", description: "自动修复可修复的问题（agent 模式）" },
-      } } } },
-  { type: "function", function: {
-      name: "ppt_look",
-      description: "把一页渲染成图片并交给视觉模型点评（版式层次、配色、留白、图文遮挡等规则检查发现不了的审美问题）。较慢、花钱：在完成一轮 ppt_edit 并通过 ppt_lint 之后再用，同一页最多看 2 次。可用 question 指定想问什么。",
-      parameters: { type: "object", properties: {
-        slide: { type: "number" }, question: { type: "string", description: "想让视觉模型重点看什么，省略 = 整体评价" },
-      } } } },
-  { type: "function", function: {
-      name: "asset_search",
-      description: "在本地素材库里按关键词找图片（花、图标、logo、背景……）。query 可同时写中英文同义词。返回完整路径，供 ppt_edit 的 add_picture 使用。不联网。没找到时用 add_shape 组合绘制，或如实告诉用户缺素材。",
-      parameters: { type: "object", properties: {
-        query: { type: "string" }, limit: { type: "number" },
-      }, required: ["query"] } } },
-  { type: "function", function: {
-      name: "ppt_open",
-      description: "新建空白演示文稿（不带 path），或打开项目内/用户点名的 .pptx 文件。用户没有打开任何文稿而要求做 PPT 时使用。",
-      parameters: { type: "object", properties: { path: { type: "string" } } } } },
-  { type: "function", function: {
-      name: "ppt_save",
-      description: "保存当前演示文稿。仅当用户明确要求保存/另存时调用；不要自动保存（用户的文件由用户决定何时保存）。带 path（项目内、.pptx）= 另存为。",
-      parameters: { type: "object", properties: { path: { type: "string" } } } } },
-];
+export { PPT_READ_NAMES };
+export const PPT_TOOLS = PPT_TOOL_DEFS as unknown as Tool[];
 const PPT_READ_SET = new Set<string>(PPT_READ_NAMES);
 
 export type AgentMode = "ask" | "agent";
@@ -249,6 +205,9 @@ const COMMON = `你是一个运行在本地工作目录中的智能助手 Agent�
     - 任务结束后检查退出码和输出：退出码 0 才算成功；失败则按第 5 条判断是环境问题还是代码问题，修复后重试。
     - 用户明确说不再等待或任务不再需要时，用 stop_job 终止。
 12. 技能与外部工具：系统提示里的"可用技能"是现成手册——任务匹配时先 use_skill 读手册再动手，并遵循其中的步骤、脚本和自检方法。
+    用户提到"有技能可以做这件事"、或要做的事可能有现成技能时，先逐条对照"可用技能"清单里的名称和用途说明
+    （用户的说法和技能名不必一字不差，例如"生成图片"可能对应 image-gen / 文生图 / draw）；找到就 use_skill。
+    没对照清单之前，不要回答"没有这个技能"；对照后确实没有，再如实说明并列出现有技能。
     .docx / .pptx / .xlsx / .pdf 用 read_document 读（read_file 读不了）。
     "外部工具（MCP）"是接入的专业工具（如药物设计、数据库）：优先用它们，而不是自己写脚本重造。
     材料很多时可用 delegate 拆给子 Agent 并行处理，只拿回结论（task 要写完整，见工具说明）。

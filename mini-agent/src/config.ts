@@ -4,6 +4,60 @@ export const MODEL = process.env.AGENT_MODEL ?? "gpt-4o-mini";
 export const MAX_STEPS = Number(process.env.AGENT_MAX_STEPS ?? 40);
 
 /**
+ * 后端：native = mini-agent 自己的 ReAct 循环 + OpenAI 兼容模型（默认）；
+ * cursor = 把任务交给 Cursor Agent（@cursor/sdk，本地运行时，模型如 composer-2.5），mini-agent 只做壳：
+ * 终端交互、/undo /diff（改动追踪）、PowerPoint 工具（以自定义工具形式提供给它）。
+ * Cursor 后端不使用 OPENAI_BASE_URL / OPENAI_API_KEY，认证用 CURSOR_API_KEY。
+ */
+export const BACKEND: "native" | "cursor" = (process.env.AGENT_BACKEND ?? "native").trim().toLowerCase() === "cursor" ? "cursor" : "native";
+/** "Composer 2.5" → "composer-2.5"：模型 ID 是小写连字符形式 */
+export const normalizeCursorModel = (s: string): string => s.trim().toLowerCase().replace(/\s+/g, "-");
+export const CURSOR_MODEL = normalizeCursorModel(process.env.AGENT_CURSOR_MODEL ?? process.env.AGENT_MODEL ?? "composer-2.5");
+/** 新建 Session 时的初始模型（随后端而定；运行中用 /model 修改） */
+export const INITIAL_MODEL = BACKEND === "cursor" ? CURSOR_MODEL : MODEL;
+
+/**
+ * 每个对话自己选模型，而模型属于哪个后端是固定的：glm-4-flash 这类走 OpenAI 兼容接口（native），
+ * composer-2.5 这类走 Cursor Agent（cursor）。所以"选模型"同时决定了这个对话用哪个后端。
+ *
+ * 可选模型 = 环境里配置过的所有模型（能不能连上，等用到时再报错）：
+ *   AGENT_MODEL          → native
+ *   AGENT_CURSOR_MODEL   → cursor
+ *   AGENT_MODELS         → 逗号分隔的更多模型；写 cursor:xxx / native:xxx 指定后端，不写就跟默认后端 AGENT_BACKEND
+ *   启动时的默认模型（INITIAL_MODEL）总是在列
+ */
+export type Backend = "native" | "cursor";
+export type ModelOption = { id: string; backend: Backend };
+
+const modelId = (id: string, backend: Backend) => (backend === "cursor" ? normalizeCursorModel(id) : id.trim());
+
+export function modelCatalog(env: NodeJS.ProcessEnv = process.env): ModelOption[] {
+  const out: ModelOption[] = [];
+  const add = (id: string | undefined, backend: Backend) => {
+    if (!id || !id.trim()) return;
+    const o = { id: modelId(id, backend), backend };
+    if (!out.some((x) => x.id === o.id && x.backend === o.backend)) out.push(o);
+  };
+  add(INITIAL_MODEL, BACKEND);
+  add(env.AGENT_MODEL, "native");
+  add(env.AGENT_CURSOR_MODEL, "cursor");
+  for (const raw of (env.AGENT_MODELS ?? "").split(/[,;\n]/)) {
+    const m = /^\s*(cursor|native)\s*:\s*(.+)$/i.exec(raw);
+    if (m) add(m[2], m[1].toLowerCase() as Backend); else add(raw, BACKEND);
+  }
+  return out;
+}
+
+/** 把用户给的模型名（可带 cursor: / native: 前缀）解析成 {id, backend}：优先按已配置的模型确定后端，没有就沿用当前后端 */
+export function resolveModel(input: string, current: Backend, env: NodeJS.ProcessEnv = process.env): ModelOption {
+  const m = /^\s*(cursor|native)\s*:\s*(.+)$/i.exec(input);
+  if (m) { const backend = m[1].toLowerCase() as Backend; return { id: modelId(m[2], backend), backend }; }
+  const text = input.trim();
+  const hits = modelCatalog(env).filter((o) => o.id === text || o.id === normalizeCursorModel(text));
+  return hits.find((o) => o.backend === current) ?? hits[0] ?? { id: modelId(text, current), backend: current };
+}
+
+/**
  * 这里没有工作目录：目录属于 Session（起点是启动时的 process.cwd()，运行中用 /cd 切换），
  * 各模块都通过参数接收 root，不存在"全局根目录"。
  * MODEL 只是新建 Session 时的初始模型；运行期以 Session.model 为准（/model 修改的就是它）。

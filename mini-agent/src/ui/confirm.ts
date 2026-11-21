@@ -1,6 +1,7 @@
 import type { FileOp } from "../policy.js";
 import { diffSummary } from "../policy.js";
 import { buildFileDiff, renderFileDiff } from "./diffview.js";
+import { say } from "../trace.js";
 
 const G = "\x1b[32m";
 const R = "\x1b[31m";
@@ -14,13 +15,14 @@ export type Approval = "yes" | "no" | "always";
 
 export async function confirmOps(ask: AskFn, ops: FileOp[]): Promise<Approval> {
   if (ops.length === 0) return "yes";
-  console.log(`\n${B}── 待确认变更 (${ops.length} 个文件) ──${X}`);
+  // 这些是回答"应用？"所需的上下文，属于用户可见内容（不是运行日志）
+  say(`\n${B}── 待确认变更 (${ops.length} 个文件) ──${X}`);
   ops.forEach((f, i) => {
     const tag =
       f.risk === "high" ? `${R}[HIGH]${X}` : f.risk === "medium" ? `${Y}[medium]${X}` : `${G}[low]${X}`;
-    console.log(`${i + 1}. ${tag} ${f.action} ${f.path}`);
-    console.log(`   ← ${f.reason || "(无说明)"}  (${diffSummary(f)})`);
-    if (f.resolved.note) console.log(`   ⚠ ${f.resolved.note}`);
+    say(`${i + 1}. ${tag} ${f.action} ${f.path}`);
+    say(`   ← ${f.reason || "(无说明)"}  (${diffSummary(f)})`);
+    if (f.resolved.note) say(`   ⚠ ${f.resolved.note}`);
   });
 
   while (true) {
@@ -30,7 +32,7 @@ export async function confirmOps(ask: AskFn, ops: FileOp[]): Promise<Approval> {
     if (ans === "n" || ans === "no" || ans === "") return "no";
     if (ans === "a" || ans === "always") return "always";
     if (ans === "d" || ans === "diff") {
-      for (const f of ops) console.log(`\n${makeDiff(f)}`);
+      for (const f of ops) say(`\n${makeDiff(f)}`);
     }
   }
 }

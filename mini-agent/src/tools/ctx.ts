@@ -5,7 +5,7 @@ import type { AgentMode } from "../llm.js";
 import type { TaskState } from "../taskstate.js";
 import type { JobManager } from "./jobs.js";
 import type { McpManager } from "../mcp.js";
-import type { PptBridge } from "../office/ppt.js";
+import type { PptBridge } from "@mini-agent/ppt-sdk";
 
 export type ApproveFn = (ops: FileOp[]) => Promise<Approval>;
 

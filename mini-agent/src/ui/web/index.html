@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mini Agent</title>
+<link rel="icon" href="/app-icon">
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<div class="shell">
+<aside id="side">
+  <div class="brand">
+    <img class="logo" src="/app-icon" alt="">
+    <span class="name">Mini Agent</span>
+    <button id="newChat" class="icon-btn" title="新对话（在当前仓库）" aria-label="新对话">
+      <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>
+    </button>
+  </div>
+  <div id="repos" class="repos"></div>
+  <div class="side-foot">
+    <div id="addRepoRow" class="add-repo" hidden>
+      <input id="addRepoInput" spellcheck="false" placeholder="仓库目录，回车确认（Esc 取消）">
+      <div id="addRepoErr" class="err"></div>
+    </div>
+    <button id="addRepo" class="link-btn">＋ 添加仓库</button>
+    <span id="status" class="status" title="连接状态">●</span>
+  </div>
+</aside>
+<div id="resize" class="resize-handle" title="拖动调整侧边栏宽度" aria-orientation="vertical" role="separator"></div>
+
+<section id="pane">
+  <!-- <div class="chathead"><span id="title" class="title">Mini Agent</span></div> -->
+  <main id="log" aria-live="polite"></main>
+
+  <footer>
+    <div id="hints" class="hints" hidden></div>
+    <select id="mode" class="mode" title="模式">
+      <option value="">Agent</option>
+      <option value="/ask ">Ask</option>
+      <option value="/fix ">Fix</option>
+      <option value="/edit ">Edit</option>
+      <option value="/diag ">Diag</option>
+    </select>
+    <select id="model" class="model" title="这个对话使用的模型"></select>
+    <textarea id="input" rows="1" placeholder="输入任务，回车发送，Shift+回车换行；输入 / 查看命令，Tab 补全" autofocus></textarea>
+    <button id="send" type="button">发送</button>
+  </footer>
+</section>
+</div>
+<script src="/app.js"></script>
+</body>
+</html>

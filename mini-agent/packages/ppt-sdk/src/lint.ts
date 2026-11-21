@@ -1,4 +1,4 @@
-import type { PptShape, PptSlide } from "./ppt.js";
+import type { PptShape, PptSlide } from "./bridge.js";
 
 /**
  * 幻灯片规则检查：纯 TS、确定性、不花 token。输入是 ppt-bridge 的 dump，输出问题列表。

@@ -48,6 +48,14 @@ export class Workspace {
     }
   }
 
+  /**
+   * 事后登记：文件已经被外部程序（如 Cursor Agent）改过了，调用方事先备份了原始内容。
+   * 语义和 record 一致（同一文件只记第一次）：orig = null 表示该文件原本不存在。之后 changes() / rollback() 照常工作。
+   */
+  recordOriginal(abs: string, orig: Buffer | null): void {
+    if (!this.journal.has(abs)) this.journal.set(abs, orig);
+  }
+
   private rel(abs: string) {
     return path.relative(this.root, abs).split(path.sep).join("/");
   }

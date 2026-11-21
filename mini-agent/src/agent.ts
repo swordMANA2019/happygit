@@ -2,8 +2,8 @@ import OpenAI from "openai";
 import {
   client, toolsFor, buildSystemPrompt, TOOLS, PPT_TOOLS, READ_TOOL_NAMES, WRITE_TOOL_NAMES, AGENT_ONLY_NAMES, type AgentMode,
 } from "./llm.js";
-import { pptRead, pptEdit, pptLint, pptLook, assetSearch, pptOpen, pptSave } from "./tools/ppt.js";
-import type { PptBridge } from "./office/ppt.js";
+import { runPptTool } from "./tools/ppt.js";
+import type { PptBridge } from "@mini-agent/ppt-sdk";
 import { readFile, writeFile, editFile, deleteFile, listFiles } from "./tools/fs.js";
 import { searchCode } from "./tools/search.js";
 import { JobManager, runCommandJob, jobOutput, stopJob, listJobs } from "./tools/jobs.js";
@@ -22,6 +22,7 @@ import { Workspace } from "./workspace.js";
 import { resolveCwd } from "./guard.js";
 import { repairMessages } from "./memory.js";
 import { emptyState, renderStateBlock, updatePlan, saveNotes, type TaskState } from "./taskstate.js";
+import { emitTrace } from "./trace.js";
 
 type Msg = OpenAI.Chat.Completions.ChatCompletionMessageParam;
 
@@ -48,6 +49,8 @@ export type AgentResult = {
   /** 最近一次写入之后模型自己运行过的"有意义的命令"（排除 cat/ls 之类）：数量、最后一条是否成功、命令文本 */
   evidence: { runs: number; lastOk: boolean | null; lastCmd: string };
   workspace: Workspace;
+  /** 本次成功改动 PowerPoint 的次数（ppt_edit / ppt_open / ppt_save / ppt_lint fix）；改动在 PowerPoint 里，不在项目文件里 */
+  pptEdits?: number;
 };
 
 export type AgentOpts = {
@@ -111,6 +114,9 @@ const PPT_WRITE_SET = new Set<string>(["ppt_edit", "ppt_open", "ppt_save"]);
 /** 只是"看一眼"的命令：不能算作"改完后验证过"的证据 */
 const TRIVIAL_CMD = /^\s*(cat|ls|dir|type|echo|pwd|cd|head|tail|wc|find|tree|which|where|get-content|get-childitem|git\s+(status|diff|log|show))\b/i;
 
+/** 工具返回里表示"这次调用没成功"的开头（界面里把这条观察标红） */
+const FAILED_OBSERVATION = /^\[(工具错误|参数错误|已拒绝|命令失败|命令已被终止|未知工具|已中断)/;
+
 const PARALLEL_SET = new Set<string>([...READ_TOOL_NAMES, "delegate"]);
 /** 轮询类调用：合法地反复出现，不参与"原地打转"检测 */
 const POLLING_SET = new Set<string>(["job_output", "list_jobs"]);
@@ -165,7 +171,7 @@ async function dispatch(name: string, args: any, ctx: ToolCtx): Promise<string> 
       case "delete_file": return withNote(await deleteFile(ctx, args.path));
       case "update_plan": {
         const out = updatePlan(ctx.state, args);
-        if (ctx.depth === 0) console.log(`\n📋 ${out}`);
+        if (ctx.depth === 0) emitTrace({ kind: "plan", text: out });
         return out;
       }
       case "save_notes":  return saveNotes(ctx.state, args);
@@ -173,13 +179,9 @@ async function dispatch(name: string, args: any, ctx: ToolCtx): Promise<string> 
       case "search_code": return await searchCode(ctx.root, args.query, args.max_results ?? 40);
       case "read_document": return await readDocument(ctx, args.path, args.start_page, args.end_page);
       case "view_image":  return await loadImage(ctx, args.path);
-      case "ppt_read":    return await pptRead(ctx, args);
-      case "ppt_edit":    return await pptEdit(ctx, args);
-      case "ppt_lint":    return await pptLint(ctx, args);
-      case "ppt_look":    return await pptLook(ctx, args);
-      case "asset_search": return await assetSearch(ctx, args);
-      case "ppt_open":    return await pptOpen(ctx, args);
-      case "ppt_save":    return await pptSave(ctx, args);
+      case "ppt_read": case "ppt_edit": case "ppt_lint": case "ppt_look":
+      case "asset_search": case "ppt_open": case "ppt_save":
+        return await runPptTool(ctx, name, args);   // 实现在 @mini-agent/ppt-sdk，见 tools/ppt.ts 的适配
       case "use_skill": {
         const { text, skill } = await loadSkillText(await discoverSkills(ctx.root), args.name);
         if (skill) ctx.usedSkills.add(skill.name);
@@ -342,7 +344,7 @@ export function compactMessages(messages: Msg[], budget = CONTEXT_CHAR_BUDGET, k
  * ========================================================================= */
 
 type LlmOutcome =
-  | { ok: true; resp: OpenAI.Chat.Completions.ChatCompletion }
+  | { ok: true; resp: OpenAI.Chat.Completions.ChatCompletion; reasoning?: string }
   | { ok: false; error: string; aborted?: boolean };
 
 async function abortableSleep(ms: number, signal?: AbortSignal) {
@@ -369,12 +371,16 @@ async function completeOnce(messages: Msg[], tools: OpenAI.Chat.Completions.Chat
       { signal, timeout: LLM_TIMEOUT_MS },
     ), { quiet }) as Completion;
   lastCallMeta.usage = (resp as any).usage;
+  const r = (resp as any).choices?.[0]?.message?.reasoning_content ?? (resp as any).choices?.[0]?.message?.reasoning;
+  if (typeof r === "string" && r) lastCallMeta.reasoning = r.slice(0, REASONING_CAP);
   return resp;
 }
 
 let currentStepLabel = "";
 /** 最近一次成功调用的输出规模（流式才有思考字符数）和接口返回的 token 用量，给统计用 */
-let lastCallMeta: { out: number; think: number; usage?: any } = { out: 0, think: 0 };
+let lastCallMeta: { out: number; think: number; usage?: any; reasoning?: string } = { out: 0, think: 0 };
+/** 留给界面展示的"推理内容"上限（只用于显示，不进对话历史） */
+const REASONING_CAP = 6000;
 /** 网关不认 stream_options（用来要 usage）时记住，不再带（进程内） */
 let streamUsageBroken = false;
 /** 只提示一次：已经要求关闭思考，模型却仍在输出思考内容 */
@@ -400,6 +406,7 @@ async function completeStream(messages: Msg[], tools: OpenAI.Chat.Completions.Ch
   let timeoutReason = "";
   let received = 0;
   let thinking = 0;
+  let reasoning = "";
   let activeTool = "";
 
   const watchdog = setInterval(() => {
@@ -446,6 +453,7 @@ async function completeStream(messages: Msg[], tools: OpenAI.Chat.Completions.Ch
       const think = d.reasoning_content ?? d.reasoning;
       if (typeof think === "string" && think) {
         thinking += think.length;
+        if (reasoning.length < REASONING_CAP) reasoning += think.slice(0, REASONING_CAP - reasoning.length);
         if (thinkingRequestedOff && !warnedThinkingIgnored) {
           warnedThinkingIgnored = true;
           console.error(`[llm] ⚠ 已要求关闭思考，但模型仍在输出思考内容：网关/模型忽略了 thinking 参数。` +
@@ -476,7 +484,7 @@ async function completeStream(messages: Msg[], tools: OpenAI.Chat.Completions.Ch
     if (!content && !toolCalls.length && !finish) throw Object.assign(new Error("模型返回了空数据流"), { status: 502 });
 
     const dt = Date.now() - t0;
-    lastCallMeta = { out: received, think: thinking, usage };
+    lastCallMeta = { out: received, think: thinking, usage, reasoning: reasoning || undefined };
     if (!quiet && dt > 20_000) console.log(`（本次模型调用用时 ${fmtSecs(dt)}，输出 ${received} 字符${thinking ? `，思考 ${thinking} 字符` : ""}）`);
 
     return {
@@ -525,7 +533,7 @@ async function callLLM(
       // 子 Agent（quiet）的调用也算：它们确实占用了时间
       stats().llm(Date.now() - callStart, messages.reduce((s, x) => s + msgSize(x), 0), outChars, lastCallMeta.think);
       stats().usage(lastCallMeta.usage);
-      return { ok: true, resp };
+      return { ok: true, resp, reasoning: lastCallMeta.reasoning };
     } catch (e: any) {
       if (signal?.aborted) return { ok: false, error: "已中断", aborted: true };
 
@@ -641,7 +649,6 @@ export async function runAgent(userContent: string, context: string, opts: Agent
     commandRuns: 0,
     depth: opts.sub ? 1 : 0,
   };
-  const log: (...a: any[]) => void = opts.sub ? () => {} : console.log;
   const tools = toolsFor(mode, { extra: mode === "agent" ? opts.mcp?.toolDefs() : undefined, sub: opts.sub, ppt: !!ctx.ppt });
 
   let step = 0;
@@ -655,7 +662,7 @@ export async function runAgent(userContent: string, context: string, opts: Agent
   let evidence: AgentResult["evidence"] = { runs: 0, lastOk: null, lastCmd: "" };
 
   const result = (status: AgentStatus, text: string): AgentResult =>
-    ({ status, text, messages, steps: step, toolCalls, commandRuns: ctx.commandRuns, evidence, workspace: ws });
+    ({ status, text, messages, steps: step, toolCalls, commandRuns: ctx.commandRuns, evidence, workspace: ws, pptEdits });
 
   try {
     for (step = 1; step <= maxSteps; step++) {
@@ -689,7 +696,7 @@ export async function runAgent(userContent: string, context: string, opts: Agent
       }
 
       /* ---- thought：模型在调用工具前的自述 ---- */
-      if (msg.content?.trim()) log(`\n💭 ${preview(msg.content.trim(), 300)}`);
+      if (!opts.sub && (msg.content?.trim() || out.reasoning)) emitTrace({ kind: "thought", step, text: msg.content?.trim() ?? "", detail: out.reasoning });
 
       /* ---- action + observation ---- */
       const runOne = async (tc: any): Promise<string> => {
@@ -699,10 +706,10 @@ export async function runAgent(userContent: string, context: string, opts: Agent
           args = JSON.parse(tc.function.arguments || "{}");
         } catch {
           // 解析失败不能静默变成 {} 再用 undefined 参数执行工具：明确告诉模型，常见原因是输出被截断
-          log(`\n[步骤 ${step}] ${fn} (参数 JSON 非法)`);
+          if (!opts.sub) emitTrace({ kind: "action", step, id: tc.id, name: fn, text: `(参数 JSON 非法) ${tc.function.arguments ?? ""}` });
           return `[参数错误] ${fn} 的 arguments 不是合法 JSON（可能因输出过长被截断）。请缩小单次修改范围后重新调用。`;
         }
-        log(`\n[步骤 ${step}] ${fn} ${preview(JSON.stringify(args), 160)}`);
+        if (!opts.sub) emitTrace({ kind: "action", step, id: tc.id, name: fn, text: JSON.stringify(args) });
 
         // 重复检测：同一调用（run_command 以"期间是否有过写入"区分）反复出现 = 在原地打转。
         // 轮询后台任务本来就要反复调用同一个 job_output，不算原地打转
@@ -745,7 +752,7 @@ export async function runAgent(userContent: string, context: string, opts: Agent
       calls.forEach((tc, i) => {
         toolCalls++;
         const r = results[i];
-        log(preview(r, 300));
+        if (!opts.sub) emitTrace({ kind: "observation", step, id: tc.id, name: tc.function.name, text: r, ok: !FAILED_OBSERVATION.test(r) });
         messages.push({ role: "tool", tool_call_id: tc.id, content: truncateMiddle(r, TOOL_OUTPUT_CAP) });
         if ([...seen.values()].some((v) => v >= 5)) stuck = true;
       });

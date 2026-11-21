@@ -1,0 +1,36 @@
+{
+  "name": "@mini-agent/ppt-sdk",
+  "version": "0.1.0",
+  "description": "Drive the PowerPoint you have open (Windows COM): read live state, edit with typed ops, lint slides, render for visual review, search local assets, watch for changes. Zero runtime dependencies.",
+  "private": true,
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "ppt-bridge.ps1",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "node --import tsx --test test/lint.test.ts test/assets.test.ts test/tools.test.ts test/watch.test.ts",
+    "test:integration": "node --import tsx --test test/integration.test.ts"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "os": [
+    "win32"
+  ],
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  }
+}

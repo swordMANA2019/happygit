@@ -2,12 +2,29 @@
   "name": "mini-agent",
   "version": "0.1.0",
   "type": "module",
+  "workspaces": [
+    "packages/*"
+  ],
   "scripts": {
+    "build:sdk": "npm run build -w @mini-agent/ppt-sdk",
+    "build:web": "node scripts/embed-web.mjs",
+    "prebuild:exe": "npm run build:sdk --silent",
+    "build:exe": "node scripts/build-exe.mjs",
+    "predev": "npm run build:sdk --silent && npm run build:web --silent",
     "dev": "node --env-file=.env --import tsx src/index.ts",
+    "preui": "npm run build:sdk --silent && npm run build:web --silent",
+    "ui": "node --env-file=.env --import tsx src/index.ts",
+    "precli": "npm run build:sdk --silent",
+    "cli": "node --env-file=.env --import tsx src/index.ts --cli",
+    "prebuild": "npm run build:sdk --silent && npm run build:web --silent",
     "build": "tsc -p tsconfig.json",
-    "start": "node dist/index.js"
+    "start": "node dist/index.js",
+    "test:sdk": "npm test -w @mini-agent/ppt-sdk",
+    "pretest:agent": "npm run build:web --silent",
+    "test:agent": "node --import tsx --test test/cursor-backend.test.ts test/web-server.test.ts test/skills.test.ts test/skills-prompt.test.ts"
   },
   "dependencies": {
+    "@mini-agent/ppt-sdk": "*",
     "dotenv": "^16.4.5",
     "fflate": "^0.8.3",
     "openai": "^4.77.0",
@@ -17,5 +34,8 @@
     "@types/node": "^22.10.2",
     "tsx": "^4.19.2",
     "typescript": "^5.7.2"
+  },
+  "optionalDependencies": {
+    "@cursor/sdk": "^1.4.2"
   }
 }

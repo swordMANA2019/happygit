@@ -14,7 +14,7 @@ import type { FailureKind } from "./errors.js";
 import type { TaskState } from "./taskstate.js";
 import type { JobManager } from "./tools/jobs.js";
 import type { McpManager } from "./mcp.js";
-import type { PptBridge } from "./office/ppt.js";
+import type { PptBridge } from "@mini-agent/ppt-sdk";
 import { snapshotTree, producedFiles } from "./snapshot.js";
 import { resetStats, stats } from "./stats.js";
 import { discoverSkills, skillVerifiers, type Skill } from "./skills.js";
@@ -307,6 +307,11 @@ export async function runFixTask(task: string, rootDir: string, opts: FixOpts = 
 
       /* -- 统一入口下的纯问答/分析回合：没改/没产出任何文件就不需要验证，答案本身就是结果 -- */
       if (opts.deferBaseline && changedNow.length === 0 && produced.length === 0) {
+        return finish("no_change");
+      }
+      /* -- 本回合只是在 PowerPoint 里操作（改动是实时的，不在项目文件里；ppt_save 另存的 .pptx 也只是交付物）：
+       *    没有代码可验证，也不需要黑盒自测——质量由 ppt_lint / ppt_look 把关。项目文件真的被改了才走下面的验证 -- */
+      if (opts.deferBaseline && (r.pptEdits ?? 0) > 0 && changedNow.length === 0) {
         return finish("no_change");
       }
 

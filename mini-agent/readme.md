@@ -144,13 +144,18 @@ LLM 超时与"看起来卡死"：
 技能 / MCP / 文档：
 - 技能目录（后者覆盖前者）：内置 skills/、~/.mini-agent/skills、<项目>/.agent/skills、<项目>/.cursor/skills。/skills 查看。
   系统提示只列 name+description，模型判断相关时调用 use_skill 读正文；技能可声明 verify 命令，在产出文件后自动校验。
+  格式要求：<名字>/SKILL.md（只支持一层目录；文件名不区分大小写），开头用 --- 包起 frontmatter，必须有 description（可以是 > / | 多行写法，会合成一行）；目录可以是符号链接/junction。
+  /skills 会列出已加载的技能、被跳过的目录及原因（缺 description、套了一层目录、没有 SKILL.md…）和搜索位置——技能没生效先看它。技能按【当前会话目录】查找，不是可执行文件所在目录；Cursor 后端不使用这套技能。
 - MCP 配置（{"mcpServers": {...}}）：~/.mini-agent/mcp.json（可信）、<项目>/.agent/mcp.json、<项目>/.cursor/mcp.json
   （项目级需用户确认，--yes 跳过）。/mcp [reload] 查看。
 - 子任务：delegate 起只读子 Agent（深度受限、最多并行 3 个），适合并行读多份资料。
 - 可选视觉检查：AGENT_VISION=1 时 view_image 可看渲染后的图片。其它环境变量：AGENT_MCP_TIMEOUT_MS、AGENT_MCP_START_TIMEOUT_MS。
 
 PowerPoint 原生控制（仅 Windows + 桌面版 PowerPoint；不用 python-pptx）：
-- 原理：常驻一个 PowerShell 进程（src/office/ppt-bridge.ps1）通过 COM 直接操作你**正打开**的演示文稿，读写都是实时的；
+- 结构：能力本身是独立可复用的库 `packages/ppt-sdk`（npm workspace：@mini-agent/ppt-sdk；API、工具定义、集成方式见它的 README），
+  与 mini-agent 无关、零运行时依赖；mini-agent 只保留 `src/tools/ppt.ts` 这一层适配（授权、视觉模型、目录约定、AGENT_* 环境变量）。
+  `npm run dev` / `npm run build` 会先自动构建 SDK；`npm run test:sdk` 跑 SDK 单元测试（不需要 Office）。
+- 原理：常驻一个 PowerShell 进程（packages/ppt-sdk/ppt-bridge.ps1）通过 COM 直接操作你**正打开**的演示文稿，读写都是实时的；
   不改文件、不自动保存；每个会话第一次修改前用 SaveCopyAs 备份到 .agent/backups/ppt/，PowerPoint 里 Ctrl+Z 可撤销。
 - 触发：对话里提到 PPT/幻灯片/PowerPoint/slide 才会启用 7 个工具并追加说明（约 1.5k token；没碰 PPT 的会话零开销）。
   工具：ppt_read（实时状态+用户选中的形状+主题）、ppt_edit（批量操作：文本框/形状/线/图片/格式/对齐/分组/页面…）、
@@ -164,14 +169,52 @@ PowerPoint 原生控制（仅 Windows + 桌面版 PowerPoint；不用 python-ppt
   或 AGENT_VISION=1 让主模型自己看图。都没配时 ppt_look 会明确告知不可用，模型只能依赖规则检查。
 - 开关：AGENT_PPT=0 关闭，AGENT_PPT=1 强制开启（默认检测注册表里是否有 PowerPoint.Application）。
   监视间隔：AGENT_WATCH_POLL_MS（默认 1500）、AGENT_WATCH_DEBOUNCE_MS（默认 3000）。
-- 用 bun 打成单文件时，把 src/office/ppt-bridge.ps1 放在可执行文件同目录即可（脚本保持 ASCII，Windows PowerShell 5.1 才能正确读取）。
+- 用 bun 打成单文件时，把 packages/ppt-sdk/ppt-bridge.ps1 放在可执行文件同目录即可（脚本保持 ASCII，Windows PowerShell 5.1 才能正确读取）。
+
+Cursor 后端（可选：AGENT_BACKEND=cursor）：
+- 作用：把任务交给 Cursor Agent（@cursor/sdk 的本地运行时）执行，可以用 composer-2.5 等 Cursor 自家模型；mini-agent 只做外壳。
+  它**不是** OpenAI 兼容端点：api.cursor.com 的 REST 接口（如 /teams/members）不能当 OPENAI_BASE_URL 用，所以单独做成后端。
+- 配置（不使用 OPENAI_BASE_URL / OPENAI_API_KEY）：
+    set AGENT_BACKEND=cursor
+    set CURSOR_API_KEY=cursor_...          # cursor.com/dashboard/integrations 的用户 API Key，或团队 service-account key（Admin API Key 不支持）
+    set AGENT_CURSOR_MODEL=composer-2.5    # 默认 composer-2.5；也可用 AGENT_MODEL；"Composer 2.5" 会自动规范成 composer-2.5；运行中 /model <id> 切换
+  需要 Node >= 22.13；@cursor/sdk 是可选依赖（npm install 默认会装；缺失时报错并提示安装）。
+- 分工：Cursor Agent 自己读/写/搜索/跑命令/验证；mini-agent 负责
+  · 终端交互、Ctrl+C 中断（会取消 Cursor 的运行）、/resume（沿用上次的 Cursor 对话）、/reset、/cd；
+  · 改动追踪：任务前备份、任务后比对，所以 /undo、/diff 和"改动文件"列表照常可用（>512KB 的大文件、被忽略的目录如 node_modules/dist 例外：只会提示，不能还原）；
+  · /ask、/diag：只读——创建 Cursor agent 时只给读类工具（白名单；若 SDK 拒绝某个名字，用 AGENT_CURSOR_ASK_TOOLS=read,grep,glob,ls,mcp 覆盖），并在事后检查文件是否被动过；
+  · PowerPoint：/ppt、/watch ppt 照常；对话里提到 PPT 时，ppt_* 工具以 SDK 的 customTools 形式提供给 Cursor Agent（ppt_look 的渲染图直接作为图片结果返回，或走 AGENT_VISION_MODEL）。
+- 不适用（后端换了，这些由 Cursor 自己负责）：mini-agent 的路径防护 / 风险确认 / 自动验证与自测 / 评审 / 技能(.agent/skills) / MCP 配置 / 后台任务 / /plan / /probe。
+  Cursor Agent 默认加载项目里的规则与技能：AGENT_CURSOR_SETTINGS=project（默认）| user,project | all | none。
+  **安全**：Cursor Agent 在本机直接改文件、执行命令。想隔离一层可设 AGENT_CURSOR_SANDBOX=1（启用 SDK 的沙箱选项）；要看 SDK 自己的 INFO 日志设 AGENT_CURSOR_SDK_LOGS=1。
+- 测试：npm run test:agent（假 SDK，不联网、不需要 key；同时跑 Web 界面服务的测试）。
+
+桌面界面（Web 窗口，不用另外起服务）：
+- 运行：**默认就是桌面界面**——开发时 `npm run ui`（或 `npm run dev`），打包后直接双击/运行 mini-agent。程序在 127.0.0.1 的随机端口起一个本地服务，并用 Edge/Chrome 的 --app 模式打开独立窗口（没有 Chrome/Edge 时退回默认浏览器的普通标签页；AGENT_UI_BROWSER 可指定浏览器路径，--no-open 只打印地址，AGENT_UI_PORT 固定端口）。关闭窗口后约 3 秒程序自动退出（AGENT_UI_EXIT_GRACE_MS 可调；刷新页面会很快重连，不受影响；电脑睡眠唤醒也不会被当成关窗口）。
+- 终端用法：`npm run cli` / `mini-agent --cli` 进入终端交互；`mini-agent "做点什么"` 是一次性命令行调用（不开窗口）；也可设 AGENT_UI=0 让无参数运行走终端。Windows 的 mini-agent.exe 是无控制台窗口的界面程序（终端里没有输出），命令行请用同目录的 mini-agent-cli.exe。界面版启动失败时错误写入 ~/.mini-agent/logs/startup-error.log。
+- 多对话（和 Cursor 一样）：左侧按仓库（目录）分组列出对话；顶部的“新对话”图标在当前仓库里新建，仓库名旁的 + 在那个仓库里新建，“添加仓库”输入目录即可加入。每个对话是独立的 Session（自己的目录、模型、记忆、撤销点、授权），可以同时运行、各自中断，输出不会串到别的对话。标题取自第一句任务；对话行下面显示它用的模型。仓库列表保存在 ~/.mini-agent/repos.json（AGENT_UI_DATA 可改）；对话本身不跨重启保存，需要时在对应仓库里 /resume。
+- 界面 vs 后端日志：聊天区只显示用户可见结果（助手回答、改动摘要、确认卡片…）和可折叠的 ReAct 过程（思考 / 动作 / 观察）；`console.*` 的运行日志（`[llm]`、`[probe]`、验证进度等）不进界面，写入 `~/.mini-agent/logs/backend-<对话id>.log`；ReAct 另有一份 `react-<对话id>.log`。
+- ReAct 过程的显示方式（仿 Cursor）：一个回合只有一个默认折叠的“过程”块，收起时是一行实时状态（“思考中… / read_file src/a.ts”）加用时，结束后变成“已处理 · 思考 N · 工具 M”。展开后是时间线：思考是一段在原地流式增长的文字（后端把模型的逐字增量按约 80ms 合并成批、同一思考共用一个 id，界面直接往同一个节点追加，不会一个词一条记录）；每个工具调用一行（图标 + 名称 + 关键参数，运行中转圈，完成 ✓ / ✗），点开看完整参数与返回。刷新页面时，回放缓冲里同一思考的增量已合并为一条。
+- 侧边栏宽度：标题栏与侧栏之间的竖条可拖动调整（宽度记在浏览器 localStorage）。
+- 模型按对话选：底部 **下拉框**（不可手输）列出环境里配置过的全部模型（`AGENT_MODEL`、`AGENT_CURSOR_MODEL`、`AGENT_MODELS` 逗号分隔；能不能连上用时再报错）；选模型只影响当前对话。新对话继承当前模型。
+- 命令都在输入框里：输入 / 弹出命令提示（带用法和说明），↑↓ 选择，Tab 补全，Enter 确认；`/model `、`/diff `、`/mcp `、`/ppt `、`/watch ` 后面还会提示可选参数。没有额外的命令按钮栏。
+- 窗口标题固定 **Mini Agent**（不含仓库名）；任务运行中 **发送** 按钮会变成 **停止**（中断当前对话）。
+- 应用图标：默认是内置的 icon.svg。想换成自己的图，把一张 icon.png（也支持 .svg .ico .jpg .webp，≤2MB）放到以下任一位置，刷新窗口即可：环境变量 AGENT_UI_ICON 指向的文件 > 可执行文件所在目录 > ~/.mini-agent/。窗口标题栏/任务栏图标取自这张图。要连 .exe 文件本身的图标也换掉：放一个 assets/icon.ico，再 npm run build:exe（Windows 目标自动带上 --windows-icon）。
+- 其它功能：流式输出、确认变更的按钮、内嵌 diff 查看器（/diff）、输出里出现的项目内图片/音频/视频路径会内嵌预览（支持 Range，可拖动进度）、中断；刷新页面会回放所有对话。
+- 与终端共用同一套命令实现（src/commands.ts），/ask /fix /edit /diag /undo /resume /ppt /watch … 行为一致。
+- 安全：只监听回环地址；每次启动随机令牌 → HttpOnly + SameSite=Strict cookie；校验 Host（防 DNS rebinding）和 POST 的 Origin；/file 只提供项目目录内的媒体/图片/PDF（防目录穿越与符号链接逃逸，不提供源码和 .env）。
+- 打包：node scripts/build-exe.mjs [bun-windows-x64 bun-linux-x64 bun-darwin-arm64 bun-darwin-x64]（npm run build:exe）。输出 release/<target>/mini-agent（界面版；Windows 上另有 mini-agent-cli.exe 控制台版）；bun 可交叉编译；Windows 目标附带 ppt-bridge.ps1（放在可执行文件同目录）。Windows 版已实机验证；macOS/Linux 目标只确认能编译，未在对应系统上运行验证。
+- 以后换原生外壳（Tauri / webview）：页面和服务协议不变，外壳只需要打开同一个地址。
+- 开发：界面源文件在 src/ui/web/（index.html / app.js / style.css，无框架无构建步骤）；scripts/embed-web.mjs 把它们嵌进 src/ui/web/assets.generated.ts（predev / prebuild / ui / test 自动运行，不入库）。
+- 测试：test/web-server.test.ts（鉴权 / Host / Origin、事件流与回放、忙碌 409、确认往返、diff、/file 范围与越权、/exit；多对话的并发与输出归属、按对话的模型 / 中断 / 审批、关闭对话与移除仓库、仓库列表持久化、图标覆盖顺序）。
 
 打包工具：
 # 装 bun（一次）
 curl -fsSL https://bun.sh/install | bash
 
 cd /mnt/source/llm-build/pythonProject/happygit/mini-agent
-bun install                      # 复用 package-lock 没问题
+bun install                      # 复用 package-lock 没问题（会链接 workspace 里的 SDK）
+npm run build:sdk                # bun 通过 SDK 的 dist 解析它，所以要先构建 SDK（npm run build 会自动做）
 
 bun build ./src/index.ts \
   --compile \

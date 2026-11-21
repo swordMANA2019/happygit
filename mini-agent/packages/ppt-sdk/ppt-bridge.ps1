@@ -80,6 +80,8 @@ function Find-Shape($app, $sl, $ref) {
   if ("$ref" -eq 'selection') {
     try { return $app.ActiveWindow.Selection.ShapeRange.Item(1) } catch { throw 'nothing is selected in PowerPoint' }
   }
+  # fast path: direct lookup by name (one COM call instead of two per shape); fall back to a scan for ids
+  try { $hit = $sl.Shapes.Item([string]$ref); if ($hit) { return $hit } } catch {}
   foreach ($s in $sl.Shapes) { if ($s.Name -eq "$ref" -or "$($s.Id)" -eq "$ref") { return $s } }
   throw "shape not found: $ref (use ppt_read to list the names/ids on this slide)"
 }
@@ -99,17 +101,22 @@ function Dump-Shape($s, [int]$z) {
       $o.autosize = [int]$tf.AutoSize
       if ($tf.HasText -ne 0) {
         $tr = $tf.TextRange
-        $o.text = [string]$tr.Text
-        $o.paragraphs = [int]$tr.Paragraphs().Count
+        $txt = [string]$tr.Text
+        $o.text = $txt
+        $o.paragraphs = $txt.Split("`r").Count   # derived locally: saves a COM round trip
         $f = $tr.Font
         $o.font = [string]$f.Name; $o.size = [double]$f.Size; $o.bold = ($f.Bold -ne 0); $o.color = To-Hex $f.Color.RGB
-        $o.textWidth = R1 $tr.BoundWidth; $o.textHeight = R1 $tr.BoundHeight
-        $o.marginL = R1 $tf.MarginLeft; $o.marginT = R1 $tf.MarginTop
+        # text metrics are only needed for the overflow check, which skips auto-sized boxes
+        if ($o.autosize -ne 1 -and $o.autosize -ne 2) {
+          $o.textHeight = R1 $tr.BoundHeight; $o.marginT = R1 $tf.MarginTop
+        }
       }
     }
   } catch {}
-  try { if ($s.Fill.Visible -ne 0 -and $t -ne 13) { $o.fill = To-Hex $s.Fill.ForeColor.RGB } } catch {}
-  try { if ($s.Line.Visible -ne 0 -and $t -ne 13) { $o.line = To-Hex $s.Line.ForeColor.RGB; $o.lineWidth = R1 $s.Line.Weight } } catch {}
+  if ($t -ne 13) {
+    try { $fl = $s.Fill; if ($fl.Visible -ne 0) { $o.fill = To-Hex $fl.ForeColor.RGB } } catch {}
+    try { $ln = $s.Line; if ($ln.Visible -ne 0) { $o.line = To-Hex $ln.ForeColor.RGB; $o.lineWidth = R1 $ln.Weight } } catch {}
+  }
   return $o
 }
 
@@ -166,8 +173,16 @@ function Fingerprint($app) {
   $sl = $pres.Slides.Item($i)
   foreach ($s in $sl.Shapes) {
     [void]$sb.Append("$($s.Id),$($s.Name),$([math]::Round($s.Left,1)),$([math]::Round($s.Top,1)),$([math]::Round($s.Width,1)),$([math]::Round($s.Height,1)),$([math]::Round($s.Rotation,1));")
-    try { if ($s.HasTextFrame -ne 0 -and $s.TextFrame.HasText -ne 0) { [void]$sb.Append("$($s.TextFrame.TextRange.Text)|$($s.TextFrame.TextRange.Font.Size)|$($s.TextFrame.TextRange.Font.Color.RGB);") } } catch {}
-    try { if ($s.Fill.Visible -ne 0) { [void]$sb.Append("f$($s.Fill.ForeColor.RGB);") } } catch {}
+    try {
+      if ($s.HasTextFrame -ne 0) {
+        $tf = $s.TextFrame
+        if ($tf.HasText -ne 0) {
+          $tr = $tf.TextRange; $f = $tr.Font
+          [void]$sb.Append("$($tr.Text)|$($f.Size)|$($f.Color.RGB);")
+        }
+      }
+    } catch {}
+    try { $fl = $s.Fill; if ($fl.Visible -ne 0) { [void]$sb.Append("f$($fl.ForeColor.RGB);") } } catch {}
   }
   $md5 = [System.Security.Cryptography.MD5]::Create()
   $h = $md5.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($sb.ToString()))
@@ -178,11 +193,12 @@ function Apply-Format($s, $a) {
   $tr = $null
   try { if ($s.HasTextFrame -ne 0) { $tr = $s.TextFrame.TextRange } } catch {}
   if ($tr) {
-    if (Has $a 'font')   { $tr.Font.Name = [string]$a.font }
-    if (Has $a 'size')   { $tr.Font.Size = [double]$a.size }
-    if (Has $a 'bold')   { $tr.Font.Bold = $(if ($a.bold) { -1 } else { 0 }) }
-    if (Has $a 'italic') { $tr.Font.Italic = $(if ($a.italic) { -1 } else { 0 }) }
-    if (Has $a 'color')  { $tr.Font.Color.RGB = (From-Hex $a.color) }
+    $fnt = $tr.Font
+    if (Has $a 'font')   { $fnt.Name = [string]$a.font }
+    if (Has $a 'size')   { $fnt.Size = [double]$a.size }
+    if (Has $a 'bold')   { $fnt.Bold = $(if ($a.bold) { -1 } else { 0 }) }
+    if (Has $a 'italic') { $fnt.Italic = $(if ($a.italic) { -1 } else { 0 }) }
+    if (Has $a 'color')  { $fnt.Color.RGB = (From-Hex $a.color) }
     if (Has $a 'align')  {
       $m = @{ left = 1; center = 2; right = 3; justify = 4 }
       if (-not $m.ContainsKey([string]$a.align)) { throw "align must be left|center|right|justify" }
