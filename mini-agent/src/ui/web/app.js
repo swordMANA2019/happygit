@@ -80,12 +80,23 @@
     queue.push(ev);
     if (!scheduled) { scheduled = true; requestAnimationFrame(flush); }
   }
+  /** 把某个元素滚到可视区顶部（留一点边距），用于"新一轮对话从顶部开始" */
+  function scrollToTop(el) {
+    const pad = 6;
+    const top = logEl.scrollTop + (el.getBoundingClientRect().top - logEl.getBoundingClientRect().top) - pad;
+    logEl.scrollTop = Math.max(0, top);
+  }
+  let pendingTop = null;                 // 本轮新出现的用户消息：等这一帧渲染完再滚过去
   function flush() {
     scheduled = false;
-    const stick = nearBottom();
+    const v = activeView();
+    // 跟随：默认"贴底才跟随"，但新一轮开始时强制跟随（消息已顶到上方，输出继续往下长）
+    const stick = v ? v.stick : nearBottom();
     while (queue.length) render(queue.shift());
-    for (const v of views.values()) while (v.el.childNodes.length > MAX_NODES) v.el.removeChild(v.el.firstChild);
-    if (stick) logEl.scrollTop = logEl.scrollHeight;
+    for (const w of views.values()) while (w.el.childNodes.length > MAX_NODES) w.el.removeChild(w.el.firstChild);
+    if (pendingTop) { const el = pendingTop; pendingTop = null; scrollToTop(el); }
+    else if (stick) logEl.scrollTop = logEl.scrollHeight;
+    if (v) v.stick = nearBottom();       // 用户手动往上滚过 → 停止跟随
   }
 
   function add(v, el) { finishProc(v); v.el.appendChild(el); v.current = null; return el; }
@@ -304,6 +315,8 @@
         d.className = "msg user";
         d.textContent = ev.text;
         add(v, d);
+        // 新一轮开始：这条消息顶到可视区顶部，后面的输出继续跟随（只对当前显示的对话生效）
+        if (v.id === active) { pendingTop = d; v.stick = true; }
         break;
       }
       case "ask": {
@@ -761,6 +774,60 @@
     resizeEl.addEventListener("mousedown", (e) => { if (e.button !== 0) return; drag = true; x0 = e.clientX; w0 = w; resizeEl.classList.add("dragging"); document.body.style.cursor = "col-resize"; document.body.style.userSelect = "none"; window.addEventListener("mousemove", move); window.addEventListener("mouseup", up); e.preventDefault(); });
     window.addEventListener("resize", apply);
   })();
+
+  /* ---------- 界面字号缩放：Ctrl +/−/0，或输入栏的 A− / A+ 按钮 ---------- */
+  (function uiZoom() {
+    const KEY = "ma-ui-scale";
+    const MIN = 0.8, MAX = 2.2, STEP = 0.1, DEFAULT = 1.18;
+    const clamp = (n) => Math.min(MAX, Math.max(MIN, Math.round(n * 10) / 10));
+    let scale = clamp(parseFloat(localStorage.getItem(KEY)) || DEFAULT);
+    const apply = () => {
+      document.documentElement.style.setProperty("--ui-scale", String(scale));
+      localStorage.setItem(KEY, String(scale));
+      for (const b of [$("zoomIn"), $("zoomOut")]) if (b) b.disabled = false;
+      if ($("zoomIn")) $("zoomIn").disabled = scale >= MAX - 1e-6;
+      if ($("zoomOut")) $("zoomOut").disabled = scale <= MIN + 1e-6;
+    };
+    apply();
+    const zoomBy = (d) => { scale = clamp(scale + d); apply(); };
+    const reset = () => { scale = DEFAULT; apply(); };
+    if ($("zoomIn")) $("zoomIn").addEventListener("click", () => zoomBy(STEP));
+    if ($("zoomOut")) $("zoomOut").addEventListener("click", () => zoomBy(-STEP));
+    window.addEventListener("keydown", (e) => {
+      if (!(e.ctrlKey || e.metaKey)) return;
+      if (e.key === "=" || e.key === "+") { e.preventDefault(); zoomBy(STEP); }
+      else if (e.key === "-" || e.key === "_") { e.preventDefault(); zoomBy(-STEP); }
+      else if (e.key === "0") { e.preventDefault(); reset(); }
+    });
+  })();
+
+  /* ---------- 主题切换 ---------- */
+  (function uiTheme() {
+    const KEY = "ma-theme";
+    const THEMES = ["dark", "light"];
+    const LABELS = { dark: "🌙", light: "☀️" };
+    let current = localStorage.getItem(KEY) || "dark";
+    if (!THEMES.includes(current)) current = "dark";
+    const apply = () => {
+      document.documentElement.setAttribute("data-theme", current);
+      localStorage.setItem(KEY, current);
+      const btn = $("theme");
+      if (btn) btn.textContent = LABELS[current] || "🌙";
+    };
+    apply();
+    if ($("theme")) {
+      $("theme").addEventListener("click", () => {
+        current = current === "dark" ? "light" : "dark";
+        apply();
+      });
+    }
+  })();
+
+  /* ---------- 滚动时实时同步 stick 状态 ---------- */
+  logEl.addEventListener("scroll", () => {
+    const v = activeView();
+    if (v) v.stick = nearBottom();
+  }, { passive: true });
 
   connect();
   autosize();

@@ -341,13 +341,23 @@ export async function startServer(opts: UiServerOptions = {}): Promise<UiServer>
 
   const PAGE_CSP = "default-src 'self'; img-src 'self' data:; media-src 'self'; style-src 'self'; script-src 'self'; frame-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'";
 
-  function serveIcon(res: http.ServerResponse, head: boolean) {
+  function serveIcon(res: http.ServerResponse, head: boolean, preferPng: boolean) {
+    // Prefer PNG when explicitly requested (/icon.png) or when the client
+    // accepts image/png (browsers on Windows/macOS handle PNG favicons more
+    // reliably than SVG). Fall back to SVG otherwise.
+    const pngAsset = ASSETS["/icon.png"];
+    const svgAsset = ASSETS["/icon.svg"];
+    const usePng = preferPng && pngAsset;
     const custom = findCustomIcon(dataDir);
     let type: string, body: Buffer | string;
     try {
       if (custom) { type = custom.type; body = fs.readFileSync(custom.file); }
-      else { type = ASSETS["/icon.svg"].type; body = ASSETS["/icon.svg"].body; }
-    } catch { type = ASSETS["/icon.svg"].type; body = ASSETS["/icon.svg"].body; }
+      else if (usePng) { type = pngAsset.type; body = Buffer.from(pngAsset.body, "base64"); }
+      else { type = svgAsset.type; body = svgAsset.body; }
+    } catch {
+      if (usePng) { type = pngAsset.type; body = Buffer.from(pngAsset.body, "base64"); }
+      else { type = svgAsset.type; body = svgAsset.body; }
+    }
     res.writeHead(200, { "content-type": type, "cache-control": "no-store", "content-security-policy": "sandbox", "x-content-type-options": "nosniff" });
     res.end(head ? undefined : body);
   }
@@ -407,8 +417,9 @@ export async function startServer(opts: UiServerOptions = {}): Promise<UiServer>
         res.end(asset.body);
         return;
       }
-      if ((url.pathname === "/app-icon" || url.pathname === "/icon.svg" || url.pathname === "/favicon.ico") && (req.method === "GET" || req.method === "HEAD")) {
-        serveIcon(res, req.method === "HEAD");
+      if ((url.pathname === "/app-icon" || url.pathname === "/icon.svg" || url.pathname === "/icon.png" || url.pathname === "/favicon.ico") && (req.method === "GET" || req.method === "HEAD")) {
+        const preferPng = url.pathname === "/icon.png" || url.pathname === "/favicon.ico";
+        serveIcon(res, req.method === "HEAD", preferPng);
         return;
       }
 

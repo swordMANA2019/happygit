@@ -12,8 +12,17 @@ rm -rf bun*
 
 bun install                      # 复用 package-lock 没问题
 
+TARGET=bun
+EXE=mini-agent
+if [[ "$*" =~ "win" ]];then
+    echo "********Install windows mini-agent********"
+    EXE=mini-agent.exe
+    TARGET=bun
+fi
 bun build ./src/index.ts \
+  --target=$TARGET\
+  --outfile $EXE\
   --compile \
-  --outfile mini-agent \
-  --target=bun
+  #--outfile mini-agent \
+  #--target=bun
 

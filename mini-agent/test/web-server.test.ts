@@ -428,7 +428,10 @@ test("app icon: page declares one; built-in svg by default; a user-supplied icon
   try {
     const ui = await startServer({ cwd: tmp, dataDir: data, captureConsole: false });
     servers.push(ui);
-    assert.match((await request(ui, "GET", "/")).body.toString(), /<link rel="icon" href="\/app-icon">/);
+    const html = (await request(ui, "GET", "/")).body.toString();
+    assert.match(html, /<link rel="icon" type="image\/png"[^>]*href="\/icon\.png">/);
+    assert.match(html, /<link rel="icon" type="image\/svg\+xml" href="\/app-icon">/);
+    assert.match(html, /<link rel="apple-touch-icon" href="\/icon\.png">/);
     const def = await request(ui, "GET", "/app-icon");
     assert.equal(def.status, 200);
     assert.equal(def.headers["content-type"], "image/svg+xml");

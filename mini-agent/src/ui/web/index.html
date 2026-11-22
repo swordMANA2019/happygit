@@ -4,7 +4,9 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Mini Agent</title>
-<link rel="icon" href="/app-icon">
+<link rel="icon" type="image/png" sizes="256x256" href="/icon.png">
+<link rel="icon" type="image/svg+xml" href="/app-icon">
+<link rel="apple-touch-icon" href="/icon.png">
 <link rel="stylesheet" href="/style.css">
 </head>
 <body>
@@ -30,7 +32,14 @@
 <div id="resize" class="resize-handle" title="拖动调整侧边栏宽度" aria-orientation="vertical" role="separator"></div>
 
 <section id="pane">
-  <!-- <div class="chathead"><span id="title" class="title">Mini Agent</span></div> -->
+  <div class="pane-top-actions">
+    <span class="zoom" title="界面字号（也可用 Ctrl + / Ctrl − / Ctrl 0）">
+      <button id="zoomOut" type="button" class="icon-btn" aria-label="缩小字号">A−</button>
+      <button id="zoomIn" type="button" class="icon-btn" aria-label="放大字号">A+</button>
+    </span>
+    <button id="theme" type="button" class="theme-btn" title="切换主题" aria-label="切换主题">🌙</button>
+  </div>
+
   <main id="log" aria-live="polite"></main>
 
   <footer>

@@ -6,7 +6,12 @@
     </linearGradient>
   </defs>
   <rect width="128" height="128" rx="28" fill="url(#g)"/>
-  <path d="M30 86 L52 64 L30 42" fill="none" stroke="#fff" stroke-width="10" stroke-linecap="round" stroke-linejoin="round"/>
-  <path d="M64 88 H98" fill="none" stroke="#fff" stroke-width="10" stroke-linecap="round" opacity=".85"/>
-  <path d="M92 22 L96 33 L107 37 L96 41 L92 52 L88 41 L77 37 L88 33 Z" fill="#fde68a"/>
+  <!-- 简化的机器人/agent 头像 -->
+  <rect x="34" y="38" width="60" height="48" rx="12" fill="none" stroke="#fff" stroke-width="7"/>
+  <circle cx="50" cy="58" r="5" fill="#fff"/>
+  <circle cx="78" cy="58" r="5" fill="#fff"/>
+  <path d="M50 72 Q64 80 78 72" fill="none" stroke="#fff" stroke-width="5" stroke-linecap="round"/>
+  <!-- 天线 -->
+  <line x1="64" y1="38" x2="64" y2="26" stroke="#fff" stroke-width="6" stroke-linecap="round"/>
+  <circle cx="64" cy="22" r="5" fill="#fde68a"/>
 </svg>

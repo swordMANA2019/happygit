@@ -593,7 +593,10 @@ async function callLLM(
       const backoff = Math.min(30_000, 1000 * 2 ** attempt) + Math.floor(Math.random() * 400);
       const wait = Math.max(info.retryAfterMs ?? 0, backoff);
       console.error(`[llm] 请求失败（${info.message.slice(0, 100)}），${(wait / 1000).toFixed(1)}s 后重试 ${attempt + 1}/${LLM_MAX_RETRIES}`);
+      const retryId = `retry-${Date.now()}`;
+      emitTrace({ kind: "thought", id: retryId, text: `请求失败，${(wait / 1000).toFixed(1)}s 后重试 ${attempt + 1}/${LLM_MAX_RETRIES}…`, append: true });
       await abortableSleep(wait, signal);
+      emitTrace({ kind: "thought", id: retryId, text: "", done: true });
     }
   }
 }

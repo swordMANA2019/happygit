@@ -19,6 +19,9 @@
     "prebuild": "npm run build:sdk --silent && npm run build:web --silent",
     "build": "tsc -p tsconfig.json",
     "start": "node dist/index.js",
+    "pretest": "npm run build:sdk --silent",
+    "test": "npm run test:agent --silent",
+    "test:all": "npm run test:agent --silent && npm run test:sdk --silent",
     "test:sdk": "npm test -w @mini-agent/ppt-sdk",
     "pretest:agent": "npm run build:web --silent",
     "test:agent": "node --import tsx --test test/cursor-backend.test.ts test/web-server.test.ts test/skills.test.ts test/skills-prompt.test.ts"
