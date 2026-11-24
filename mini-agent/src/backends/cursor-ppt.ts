@@ -1,6 +1,6 @@
 import { PPT_TOOL_DEFS, PPT_READ_NAMES } from "@mini-agent/ppt-sdk";
 import { runPptTool } from "../tools/ppt.js";
-import type { ToolCtx } from "../tools/ctx.js";
+import type { ToolCtx } from "../tools/context.js";
 
 /**
  * 把 @mini-agent/ppt-sdk 的工具（ppt_read / ppt_edit / ppt_lint / ppt_look / asset_search / ppt_open / ppt_save）

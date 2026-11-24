@@ -8,16 +8,17 @@ import { readFile, writeFile, editFile, deleteFile, listFiles } from "./tools/fs
 import { searchCode } from "./tools/search.js";
 import { JobManager, runCommandJob, jobOutput, stopJob, listJobs } from "./tools/jobs.js";
 import { readDocument, loadImage } from "./tools/docs.js";
+import { foldOldWrites, foldOldToolOutputs, compactMessages} from "./tools/utils.js";
 import { discoverSkills, loadSkillText } from "./skills.js";
 import { isMcpToolName, type McpManager } from "./mcp.js";
-import type { ToolCtx, ApproveFn } from "./tools/ctx.js";
+import type { ToolCtx, ApproveFn } from "./tools/context.js";
 import {
   MAX_STEPS, TOOL_OUTPUT_CAP, LLM_MAX_RETRIES, LLM_TIMEOUT_MS, CONTEXT_CHAR_BUDGET,
   LLM_FIRST_TOKEN_MS, LLM_IDLE_MS, LLM_TOTAL_MS, LLM_STREAM, HEARTBEAT_MS, THINK_MAX_CHARS, extraBodyFor, autoThinkingOff, disableAutoThinking, EARLY_FOLD_RATIO,
 } from "./config.js";
 import { stats } from "./stats.js";
 import { classifyLlmError } from "./errors.js";
-import { sleep, truncateMiddle, fmtSecs, withHeartbeat } from "./util.js";
+import { sleep, truncateMiddle, fmtSecs, withHeartbeat, msgSize} from "./util.js";
 import { Workspace } from "./workspace.js";
 import { resolveCwd } from "./guard.js";
 import { repairMessages } from "./memory.js";
@@ -223,121 +224,6 @@ async function dispatch(name: string, args: any, ctx: ToolCtx): Promise<string> 
   }
 }
 
-/* =========================================================================
- * 上下文压缩：messages 只增不减会在长任务里撑爆窗口
- * 策略：保留 system + 任务 + 最近 N 条工具输出，较早的工具输出折叠成摘要。
- * 只改 content，不动 tool_call_id 配对，所以协议始终合法。
- * ========================================================================= */
-
-function msgSize(m: Msg): number {
-  const c = (m as any).content;
-  // 带图片的消息：base64 本身不计入字符预算，按固定开销估算
-  let n = typeof c === "string" ? c.length
-    : Array.isArray(c) ? c.reduce((s: number, p: any) => s + (p?.type === "text" ? String(p.text).length : 1500), 0)
-    : c ? JSON.stringify(c).length : 0;
-  const tcs = (m as any).tool_calls;
-  if (tcs) n += JSON.stringify(tcs).length;
-  return n;
-}
-
-/**
- * 提前折叠：写大文件的任务里，每个 write_file 的整份内容都留在历史里、每一步都被重新发给模型——
- * 但这些文件已经在磁盘上了（需要时 read_file 即可）。历史长到预算的 EARLY_FOLD_RATIO 就开始折叠
- * 较早的 write_file/edit_file 大参数（最近 3 轮保留原样；保持 JSON 合法，路径等字段不动）。
- * 比"超预算才折叠"早得多：每步少发几万字符，就是每步少等几秒的预填充时间。
- */
-export function foldOldWrites(messages: Msg[], budget = CONTEXT_CHAR_BUDGET, keepRecentTurns = 3): number {
-  let total = messages.reduce((s, m) => s + msgSize(m), 0);
-  if (total < budget * EARLY_FOLD_RATIO) return 0;
-
-  const turns = messages.map((m, i) => ((m as any).tool_calls?.length ? i : -1)).filter((i) => i >= 0);
-  const old = turns.slice(0, Math.max(turns.length - keepRecentTurns, 0));
-  let folded = 0;
-  for (const i of old) {
-    for (const tc of (messages[i] as any).tool_calls ?? []) {
-      const name = tc.function?.name;
-      if (name !== "write_file" && name !== "edit_file") continue;
-      const raw: string = tc.function?.arguments ?? "";
-      if (raw.length < 1200) continue;
-      try {
-        const a = JSON.parse(raw);
-        for (const k of ["content", "old_text", "new_text"]) {
-          if (typeof a[k] === "string" && a[k].length > 500) a[k] = `[已折叠 ${a[k].length} 字符：这部分已写入磁盘，需要请 read_file]`;
-        }
-        const next = JSON.stringify(a);
-        total -= raw.length - next.length;
-        tc.function.arguments = next;
-        folded++;
-      } catch { /* 参数不是合法 JSON：不动 */ }
-    }
-  }
-  return folded;
-}
-
-/**
- * 提前折叠旧的工具输出：每一步都会把整份历史重发一遍，一个 10k 字符的 read_file 结果放在历史里，
- * 之后 N 步就是 N 倍的输入 token。历史长到预算的 EARLY_FOLD_RATIO 就开始，把"最近 keepRecent 个之前"的
- * 大块工具输出收成"头部 + 标记"（需要时模型可重新调用工具；重要结论应该已经记在 save_notes / 计划里）。
- * 只改 content，不动 tool_call_id 配对。
- */
-export function foldOldToolOutputs(messages: Msg[], budget = CONTEXT_CHAR_BUDGET, keepRecent = 10, minLen = 1500): number {
-  let total = messages.reduce((s, m) => s + msgSize(m), 0);
-  if (total < budget * EARLY_FOLD_RATIO) return 0;
-  const toolIdx = messages.map((m, i) => (m.role === "tool" ? i : -1)).filter((i) => i >= 0);
-  const old = toolIdx.slice(0, Math.max(toolIdx.length - keepRecent, 0));
-  let folded = 0;
-  for (const i of old) {
-    const m = messages[i] as any;
-    if (typeof m.content !== "string" || m.content.length < minLen) continue;
-    const before = m.content.length;
-    m.content = `[较早的工具输出已折叠，原 ${before} 字符；如需请重新调用工具] ${m.content.slice(0, 400).replace(/\s+/g, " ")}…`;
-    total -= before - m.content.length;
-    folded++;
-  }
-  return folded;
-}
-
-export function compactMessages(messages: Msg[], budget = CONTEXT_CHAR_BUDGET, keepRecent = 8): number {
-  let total = messages.reduce((s, m) => s + msgSize(m), 0);
-  if (total <= budget) return 0;
-
-  let folded = 0;
-  const toolIdx = messages.map((m, i) => (m.role === "tool" ? i : -1)).filter((i) => i >= 0);
-  const foldable = toolIdx.slice(0, Math.max(toolIdx.length - keepRecent, 0));
-
-  for (const i of foldable) {
-    if (total <= budget) break;
-    const m = messages[i] as any;
-    if (typeof m.content !== "string" || m.content.length < 400) continue;
-    const before = m.content.length;
-    m.content = `[较早的工具输出已折叠，原 ${before} 字符；如需请重新调用工具] ${m.content.slice(0, 160).replace(/\s+/g, " ")}…`;
-    total -= before - m.content.length;
-    folded++;
-  }
-
-  // 仍超预算：折叠较早 assistant 里体积很大的 write_file 参数（保持 JSON 合法）
-  if (total > budget) {
-    const cut = messages.length - keepRecent * 2;
-    for (let i = 2; i < cut && total > budget; i++) {
-      const m = messages[i] as any;
-      for (const tc of m.tool_calls ?? []) {
-        const raw: string = tc.function?.arguments ?? "";
-        if (raw.length < 2000) continue;
-        try {
-          const a = JSON.parse(raw);
-          for (const k of ["content", "old_text", "new_text"]) {
-            if (typeof a[k] === "string" && a[k].length > 500) a[k] = `[已折叠 ${a[k].length} 字符]`;
-          }
-          const next = JSON.stringify(a);
-          total -= raw.length - next.length;
-          tc.function.arguments = next;
-          folded++;
-        } catch { /* 参数本来就不是合法 JSON，不动它 */ }
-      }
-    }
-  }
-  return folded;
-}
 
 /* =========================================================================
  * LLM 调用：重试 + 退避 + 上下文溢出自救 + 可中断
@@ -583,7 +469,7 @@ async function callLLM(
 
       if (info.contextOverflow && !overflowHandled) {
         overflowHandled = true;
-        const n = compactMessages(messages, Math.floor(CONTEXT_CHAR_BUDGET / 3), 4);
+        const n = compactMessages(messages, ctx, Math.floor(CONTEXT_CHAR_BUDGET / 3), 4);
         console.error(`[llm] 上下文超限，已折叠 ${n} 处旧输出后重试`);
         if (n > 0) continue;
       }
@@ -671,9 +557,9 @@ export async function runAgent(userContent: string, context: string, opts: Agent
     for (step = 1; step <= maxSteps; step++) {
       if (signal?.aborted) return result("aborted", lastText || "已中断");
 
-      foldOldWrites(messages);
-      foldOldToolOutputs(messages);
-      compactMessages(messages);
+      foldOldWrites(messages, ctx);
+      foldOldToolOutputs(messages,ctx);
+      compactMessages(messages, ctx);
       if (messages[0]?.role === "system") messages[0] = makeSys();
       currentStepLabel = `步骤 ${step}`;
       const out = await callLLM(messages, tools, opts.model, signal, !!opts.sub);

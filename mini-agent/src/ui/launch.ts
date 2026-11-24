@@ -176,7 +176,7 @@ export async function openAppWindow(url: string): Promise<"app" | "browser" | "n
       const args = [
         `--app=${url}`,
         `--user-data-dir=${profile}`,
-        "--window-size=1280,860",
+        "--window-size=1180,720",
         "--no-first-run",
         "--no-default-browser-check",
         "--disable-session-crashed-bubble",

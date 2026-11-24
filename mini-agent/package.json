@@ -6,6 +6,9 @@
     "packages/*"
   ],
   "scripts": {
+    "build:win": "bun build ./src/index.ts --target=bun --outfile mini-agent.exe --compile --windows-hide-console",
+    "build:linux": "bun build ./src/index.ts --target=bun --outfile mini-agent --compile --windows-hide-console",
+    "build:mac": "bun build ./src/index.ts --target=bun --outfile mini-agent --compile --windows-hide-console",
     "build:sdk": "npm run build -w @mini-agent/ppt-sdk",
     "build:web": "node scripts/embed-web.mjs",
     "prebuild:exe": "npm run build:sdk --silent",

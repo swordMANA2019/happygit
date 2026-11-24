@@ -2,7 +2,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { unzipSync, strFromU8 } from "fflate";
 import { resolveForRead, isReadable } from "./fs.js";
-import type { ToolCtx } from "./ctx.js";
+import type { ToolCtx } from "./context.js";
 
 /**
  * 读取办公文档/PDF 的文本内容：docx / pptx / xlsx / pdf（纯文本类文件请用 read_file）。

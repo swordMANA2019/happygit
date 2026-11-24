@@ -4,7 +4,8 @@ import { IGNORE } from "../config.js";
 import { resolvePath, isSensitivePath, isUnderAny, type ResolveResult } from "../guard.js";
 import { classify, decide, type FileOp } from "../policy.js";
 import { autoAllowed } from "../ui/confirm.js";
-import type { ToolCtx } from "./ctx.js";
+import type { ToolCtx } from "./context.js";
+import { getFileMemories, mergeRanges, extractStructure } from "./utils.js"
 
 const MAX_READ_BYTES = 2 * 1024 * 1024;
 const MAX_READ_LINES = 2000;
@@ -97,7 +98,29 @@ export async function readFile(ctx: ToolCtx, p: unknown, start?: number, end?: n
     note = `\n…（共 ${lines.length} 行，仅显示前 ${MAX_READ_LINES} 行，用 start_line 继续读取）`;
   }
   if (s > lines.length) return `文件只有 ${lines.length} 行`;
-  return lines.slice(s - 1, e).map((l, i) => `${s + i}: ${l}`).join("\n") + note;
+
+  // --- Record read range & extract structural outline ---
+  const relPath = String(p);
+  const memories = getFileMemories(ctx);
+  let mem = memories.get(relPath);
+
+  // Reset memory if file was modified on disk since last read
+  if (!mem || mem.mtimeMs !== st.mtimeMs) {
+    mem = {
+      relPath,
+      totalLines: lines.length,
+      mtimeMs: st.mtimeMs,
+      readRanges: [],
+      outline: new Map(),
+    };
+    memories.set(relPath, mem);
+  }
+
+  mem.readRanges = mergeRanges([...mem.readRanges, [s, e]]);
+  const slice = lines.slice(s - 1, e);
+  extractStructure(relPath, slice, s, mem.outline);
+
+  return slice.map((l, i) => `${s + i}: ${l}`).join("\n") + note;
 }
 
 export async function writeFile(ctx: ToolCtx, p: unknown, content: string): Promise<string> {

@@ -7,7 +7,7 @@ import { runFixTask, type FixOpts, type FixResult } from "./fix.js";
 import { diagnose, type DiagnoseResult } from "./diagnose.js";
 import { ensureManifest, invalidateManifest } from "./probe.js";
 import { confirmOps } from "./ui/confirm.js";
-import type { ApproveFn } from "./tools/ctx.js";
+import type { ApproveFn } from "./tools/context.js";
 import type { Workspace } from "./workspace.js";
 import { MODEL, BACKEND, INITIAL_MODEL, normalizeCursorModel } from "./config.js";
 import {
@@ -18,7 +18,7 @@ import { JobManager } from "./tools/jobs.js";
 import { McpManager } from "./mcp.js";
 import { PptBridge } from "@mini-agent/ppt-sdk";
 import { pptAvailable } from "./tools/ppt.js";
-import type { ToolCtx } from "./tools/ctx.js";
+import type { ToolCtx } from "./tools/context.js";
 import { CursorBackend, type CursorTurn, type CursorSdkLike } from "./backends/cursor.js";
 import { pptCustomTools } from "./backends/cursor-ppt.js";
 

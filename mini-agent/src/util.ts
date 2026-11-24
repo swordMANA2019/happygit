@@ -1,4 +1,7 @@
+import OpenAI from "openai";
 import { HEARTBEAT_MS } from "./config.js";
+
+export type Msg = OpenAI.Chat.Completions.ChatCompletionMessageParam;
 
 const ANSI_RE = /\u001b\[[0-9;?]*[ -/]*[@-~]/g;
 
@@ -37,3 +40,14 @@ export async function withHeartbeat<T>(label: string, fn: () => Promise<T>, opts
 }
 
 export const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
+export function msgSize(m: Msg): number {
+  const c = (m as any).content;
+  // 带图片的消息：base64 本身不计入字符预算，按固定开销估算
+  let n = typeof c === "string" ? c.length
+    : Array.isArray(c) ? c.reduce((s: number, p: any) => s + (p?.type === "text" ? String(p.text).length : 1500), 0)
+    : c ? JSON.stringify(c).length : 0;
+  const tcs = (m as any).tool_calls;
+  if (tcs) n += JSON.stringify(tcs).length;
+  return n;
+}

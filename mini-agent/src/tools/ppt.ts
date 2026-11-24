@@ -4,7 +4,7 @@ import {
 } from "@mini-agent/ppt-sdk";
 import { client } from "../llm.js";
 import { VISION_MODEL, PPT_ENABLED, ASSETS_DIRS, extraBodyFor } from "../config.js";
-import type { ToolCtx } from "./ctx.js";
+import type { ToolCtx } from "./context.js";
 import { resolveForRead, isReadable } from "./fs.js";
 
 /**

@@ -4,7 +4,7 @@ import { runAgent } from "./agent.js";
 import { buildContext } from "./context.js";
 import crypto from "node:crypto";
 import { MODEL, MAX_RETRIES, ERROR_DIGEST, VERIFY_TIMEOUT_MS } from "./config.js";
-import type { ApproveFn } from "./tools/ctx.js";
+import type { ApproveFn } from "./tools/context.js";
 import { ensureManifest, type Manifest } from "./probe.js";
 import { runCritic, shouldSkipCritic } from "./critic.js";
 import { execCommand } from "./tools/shell.js";
