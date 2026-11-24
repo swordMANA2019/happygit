@@ -10,7 +10,7 @@ export const client = new OpenAI({
   maxRetries: 0, // 重试由 agent.ts 的 callLLM 统一控制（可感知 Retry-After、可中断、可日志）
 });
 
-type Tool = OpenAI.Chat.Completions.ChatCompletionTool;
+export type Tool = OpenAI.Chat.Completions.ChatCompletionTool;
 
 export const READ_TOOL_NAMES = ["read_file", "list_files", "search_code", "read_document", "view_image"] as const;
 export const WRITE_TOOL_NAMES = ["write_file", "edit_file", "delete_file"] as const;

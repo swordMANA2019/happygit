@@ -5,7 +5,7 @@ import { resolvePath, isSensitivePath, isUnderAny, type ResolveResult } from "..
 import { classify, decide, type FileOp } from "../policy.js";
 import { autoAllowed } from "../ui/confirm.js";
 import type { ToolCtx } from "./context.js";
-import { getFileMemories, mergeRanges, extractStructure } from "./utils.js"
+import { getFileMemories, mergeRanges, extractStructure } from "./util.js"
 
 const MAX_READ_BYTES = 2 * 1024 * 1024;
 const MAX_READ_LINES = 2000;

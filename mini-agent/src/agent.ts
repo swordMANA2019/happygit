@@ -8,7 +8,7 @@ import { readFile, writeFile, editFile, deleteFile, listFiles } from "./tools/fs
 import { searchCode } from "./tools/search.js";
 import { JobManager, runCommandJob, jobOutput, stopJob, listJobs } from "./tools/jobs.js";
 import { readDocument, loadImage } from "./tools/docs.js";
-import { foldOldWrites, foldOldToolOutputs, compactMessages} from "./tools/utils.js";
+import { foldOldWrites, foldOldToolOutputs, compactMessages} from "./tools/util.js";
 import { discoverSkills, loadSkillText } from "./skills.js";
 import { isMcpToolName, type McpManager } from "./mcp.js";
 import type { ToolCtx, ApproveFn } from "./tools/context.js";
@@ -394,7 +394,7 @@ async function completeStream(messages: Msg[], tools: OpenAI.Chat.Completions.Ch
 }
 
 async function callLLM(
-  messages: Msg[], tools: OpenAI.Chat.Completions.ChatCompletionTool[], model: string,
+  messages: Msg[], ctx:ToolCtx, model: string,
   signal?: AbortSignal, quiet = false,
 ): Promise<LlmOutcome> {
   let overflowHandled = false;
@@ -411,8 +411,8 @@ async function callLLM(
         ? [...messages, { role: "user", content: "[系统] 上一次尝试因思考过长被中止。这一步请不要长时间思考：直接调用最合适的工具，或直接给出结论。" }]
         : messages;
       const resp = streamingBroken
-        ? await completeOnce(reqMessages, tools, model, signal, quiet)
-        : await completeStream(reqMessages, tools, model, signal, quiet, nudge ? 0 : THINK_MAX_CHARS);
+        ? await completeOnce(reqMessages, ctx.tools, model, signal, quiet)
+        : await completeStream(reqMessages, ctx.tools, model, signal, quiet, nudge ? 0 : THINK_MAX_CHARS);
       if (!resp.choices?.[0]?.message) throw Object.assign(new Error("模型返回了空 choices"), { status: 502 });
       const m: any = resp.choices[0].message;
       const outChars = lastCallMeta.out || ((m.content?.length ?? 0) + (m.tool_calls ?? []).reduce((s: number, t: any) => s + (t.function?.arguments?.length ?? 0), 0));
@@ -537,8 +537,8 @@ export async function runAgent(userContent: string, context: string, opts: Agent
     pendingImages: [],
     commandRuns: 0,
     depth: opts.sub ? 1 : 0,
+    tools: toolsFor(mode, { extra: mode === "agent" ? opts.mcp?.toolDefs() : undefined, sub: opts.sub, ppt: !!ctx.ppt })
   };
-  const tools = toolsFor(mode, { extra: mode === "agent" ? opts.mcp?.toolDefs() : undefined, sub: opts.sub, ppt: !!ctx.ppt });
 
   let step = 0;
   let toolCalls = 0;
@@ -562,7 +562,7 @@ export async function runAgent(userContent: string, context: string, opts: Agent
       compactMessages(messages, ctx);
       if (messages[0]?.role === "system") messages[0] = makeSys();
       currentStepLabel = `步骤 ${step}`;
-      const out = await callLLM(messages, tools, opts.model, signal, !!opts.sub);
+      const out = await callLLM(messages, ctx, opts.model, signal, !!opts.sub);
       if (!out.ok) return result(out.aborted ? "aborted" : "llm_error", out.error);
 
       const choice = out.resp.choices[0];
