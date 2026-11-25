@@ -5,7 +5,7 @@ import type { AgentMode, Tool } from "../llm.js";
 import type { TaskState } from "../taskstate.js";
 import type { JobManager } from "./jobs.js";
 import type { McpManager } from "../mcp.js";
-import type { FileMemory } from "./util.js";
+import type { FileMemory, FoldStateTracker } from "./util.js";
 import type { PptBridge } from "@mini-agent/ppt-sdk";
 
 export type ApproveFn = (ops: FileOp[]) => Promise<Approval>;
@@ -54,6 +54,6 @@ export type ToolCtx = {
    * 用来把"修改前基线验证"延后到确实要改代码时才做：纯问答/分析的对话不会白跑一遍测试。
    */
   beforeWrite?: () => Promise<string | void>;
-  fileMemories?: Map<string, FileMemory>;
+  foldTracker?: Map<string, FoldStateTracker>;
   tools:Tool[];
 };

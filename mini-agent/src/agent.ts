@@ -537,7 +537,7 @@ export async function runAgent(userContent: string, context: string, opts: Agent
     pendingImages: [],
     commandRuns: 0,
     depth: opts.sub ? 1 : 0,
-    tools: toolsFor(mode, { extra: mode === "agent" ? opts.mcp?.toolDefs() : undefined, sub: opts.sub, ppt: !!ctx.ppt })
+    tools: toolsFor(mode, { extra: mode === "agent" ? opts.mcp?.toolDefs() : undefined, sub: opts.sub, ppt: !!(opts.sub ? undefined : opts.ppt) })
   };
 
   let step = 0;

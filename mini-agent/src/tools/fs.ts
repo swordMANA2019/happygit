@@ -5,7 +5,7 @@ import { resolvePath, isSensitivePath, isUnderAny, type ResolveResult } from "..
 import { classify, decide, type FileOp } from "../policy.js";
 import { autoAllowed } from "../ui/confirm.js";
 import type { ToolCtx } from "./context.js";
-import { getFileMemories, mergeRanges, extractStructure } from "./util.js"
+import { recordFileRead, recordFileWrite, recordFileDelete} from "./util.js"
 
 const MAX_READ_BYTES = 2 * 1024 * 1024;
 const MAX_READ_LINES = 2000;
@@ -99,27 +99,8 @@ export async function readFile(ctx: ToolCtx, p: unknown, start?: number, end?: n
   }
   if (s > lines.length) return `文件只有 ${lines.length} 行`;
 
-  // --- Record read range & extract structural outline ---
-  const relPath = String(p);
-  const memories = getFileMemories(ctx);
-  let mem = memories.get(relPath);
-
-  // Reset memory if file was modified on disk since last read
-  if (!mem || mem.mtimeMs !== st.mtimeMs) {
-    mem = {
-      relPath,
-      totalLines: lines.length,
-      mtimeMs: st.mtimeMs,
-      readRanges: [],
-      outline: new Map(),
-    };
-    memories.set(relPath, mem);
-  }
-
-  mem.readRanges = mergeRanges([...mem.readRanges, [s, e]]);
   const slice = lines.slice(s - 1, e);
-  extractStructure(relPath, slice, s, mem.outline);
-
+  recordFileRead(ctx, String(p), lines.length, st.mtimeMs, s, e, slice);
   return slice.map((l, i) => `${s + i}: ${l}`).join("\n") + note;
 }
 
@@ -139,6 +120,10 @@ export async function writeFile(ctx: ToolCtx, p: unknown, content: string): Prom
   await ctx.workspace.record(r.abs);
   await fs.mkdir(path.dirname(r.abs), { recursive: true });
   await fs.writeFile(r.abs, content, "utf-8");
+
+  const st = await fs.stat(r.abs).catch(() => null);
+  if (st) recordFileWrite(ctx, String(p), st.mtimeMs, content);
+
   console.error(`[audit] WRITE ${r.abs}`);
   return `已写入 ${String(p)}（${content.length} 字符）`;
 }
@@ -174,6 +159,10 @@ export async function editFile(ctx: ToolCtx, p: unknown, oldText: string, newTex
 
   await ctx.workspace.record(r.abs);
   await fs.writeFile(r.abs, next, "utf-8");
+
+  const st = await fs.stat(r.abs).catch(() => null);
+  if (st) recordFileWrite(ctx, String(p), st.mtimeMs, next);
+
   console.error(`[audit] EDIT ${r.abs}`);
   return `已替换 ${String(p)}`;
 }
@@ -192,6 +181,9 @@ export async function deleteFile(ctx: ToolCtx, p: unknown): Promise<string> {
 
   await ctx.workspace.record(r.abs);
   await fs.unlink(r.abs);
+
+  recordFileDelete(ctx, String(p));
+  
   console.error(`[audit] DELETE ${r.abs}`);
   return `已删除 ${String(p)}`;
 }
